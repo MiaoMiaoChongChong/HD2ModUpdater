@@ -27,7 +27,8 @@ ST_BETA = "beta"            # 只有测试版可更
 ST_OK = "ok"                # 已最新
 ST_UNKNOWN = "unknown"      # 版本无法比较
 ST_ERROR = "error"          # 查询失败
-ST_NO_SOURCE = "nosource"   # 还没找到来源
+ST_NO_SOURCE = "nosource"   # 查过了，但没找到来源
+ST_UNCHECKED = "unchecked"  # 还没检查（刚打开程序时的初始状态）
 
 
 def sources_path() -> str:
@@ -35,7 +36,11 @@ def sources_path() -> str:
 
 
 def load_sources() -> dict:
-    """读来源表：{mod_uuid 或 label: [{provider,id,url,...}]}"""
+    """读来源表：{mod_uuid 或 label: [{provider,id,url,...,"manual":True?}]}
+
+    ``manual: True`` 的条目是**用户手工填写/确认过的**，
+    永远不会被自动识别结果覆盖，也不会被「清空来源缓存」抹掉。
+    """
     try:
         with open(sources_path(), encoding="utf-8-sig") as f:
             return json.load(f) or {}
@@ -48,6 +53,31 @@ def save_sources(data: dict) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, sources_path())
+
+
+def set_manual_source(entry: dict, src: dict) -> None:
+    """写入一条**用户手工指定**的来源（打 manual 标记，受保护）。"""
+    data = load_sources()
+    key = source_key(entry)
+    rec = {k: v for k, v in src.items() if k in ("provider", "id", "url", "asset")}
+    rec["manual"] = True
+    data[key] = [rec]
+    save_sources(data)
+
+
+def clear_auto_sources() -> int:
+    """清掉自动识别的来源，**保留手工指定的**。返回清掉的条数。"""
+    data = load_sources()
+    kept = {}
+    removed = 0
+    for key, items in (data or {}).items():
+        manual = [i for i in (items or []) if i.get("manual")]
+        if manual:
+            kept[key] = manual
+        else:
+            removed += 1
+    save_sources(kept)
+    return removed
 
 
 def source_key(entry: dict) -> str:
@@ -261,9 +291,11 @@ class Engine:
     def persist_resolved(self) -> None:
         """把自动识别结果写回来源表，下次直接用。
 
-        只保存**高可信度**的来源。低可信的（如索引里 56% 的噪声匹配）
-        绝不落盘 —— 一旦存进去就会固化成错误的"已确认来源"，
-        下次直接拿它去比版本，用户会被引到错误的 mod 页面上去。
+        两道保护，确保**用户手工填写的来源永远不被覆盖**：
+          1. 已存在的 key 一律跳过（无论手工还是自动）；
+          2. 只保存高可信度的结果 —— 低可信（如索引里 56% 的噪声匹配）
+             绝不落盘，否则会固化成错误的"已确认来源"，
+             下次直接拿它去比版本，用户会被引到错误的 mod 页面上去。
         """
         saved = load_sources()
         added = 0
