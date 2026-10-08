@@ -6,21 +6,66 @@
 Arsenal 只对「N 网下载的模组」查更新（详见下方原理），从 GitHub / ayakamods 手动导入的
 ZIP 它永远不认识。这个工具就是补这一块——**它只读 Arsenal 的库，加载和部署仍然交给 Arsenal**。
 
+> **English TL;DR** — A Chinese-UI companion updater for **HD2 Arsenal** (Helldivers 2).
+> Arsenal only tracks updates for mods installed from Nexus; mods you grabbed from
+> GitHub or ayakamods.com are invisible to it. This tool fills that gap: it auto-detects
+> the Arsenal library, figures out where each mod is published, checks all three sites
+> for updates, and downloads what it can. Read-only — it never modifies your Arsenal data.
+> Windows 10/11, no Python needed (standalone EXE).
+
+## 界面预览
+
+![界面截图](docs/screenshot-main.png)
+
+一行一个模组，一眼看清：**本地版本 / 线上版本 / 来源站点 / 该做什么**。
+
+---
+
+## 为什么需要它
+
+如果你的模组全是从 Nexus 装的，**Arsenal 自己就够了，不用装这个**。
+
+但只要你从别处装过模组 —— GitHub 的 release、ayakamods.com 的下载页 ——
+Arsenal 就永远不知道它们有新版。这个工具专门补这一块。
+
+| | Arsenal 自带 | 本工具 |
+|---|---|---|
+| Nexus 来源模组 | ✅ | ✅（需自填 API key） |
+| GitHub 来源模组 | ❌ | ✅ |
+| ayakamods 来源模组 | ❌ | ✅ |
+| 自动识别模组来自哪个站点 | ❌ | ✅ |
+| 一键下载 | 仅 N 网 | GitHub 全自动；另两站半自动 |
+
 ---
 
 ## 快速开始
 
-1. 双击 **`启动.bat`**
-2. 程序会自动找到 Arsenal 的模组库（找不到才让你手动选）
-3. 点 **「检查更新」**
-4. 有更新的会标出来；能自动下载的点 **「下载全部可自动下载的」**
+### 方式一：下载 EXE（推荐，免装 Python）
+
+到 [Releases](../../releases) 下载 `HD2ModUpdater.exe`，双击即可。
+
+> 首次运行 Windows SmartScreen 可能提示"未知发布者"（未做代码签名），
+> 点「更多信息」→「仍要运行」。
+
+### 方式二：从源码运行
+
+需要 Python 3.9+（tkinter 随 Python 自带）：
+
+```powershell
+python run.py           # 打开图形界面
+python run.py --check   # 命令行检查一遍
+```
+
+1. 程序会自动找到 Arsenal 的模组库（找不到才让你手动选）
+2. 点 **「检查更新」**
+3. 有更新的会标出来；能自动下载的点 **「下载全部可自动下载的」**
 
 ### 第一次用（或换了台新电脑）
 
 界面上会出现一条黄色提示：
 
 > **第一次使用**：还没有识别过模组来源。点右边「开始识别来源」，
-> 我会自动找出这 20 个模组各自在网上对应哪个页面。
+> 工具会自动找出这些模组各自在网上对应哪个页面。
 
 点 **「开始识别来源」** 即可。它会为每个模组找出它发布在哪个网站
 （GitHub / N网 / ayakamods），**结果会保存下来，以后不用重复找**。
@@ -64,7 +109,7 @@ GitHub Token 同理 —— 设置里有两个按钮：
 > 本工具用的是官方推荐的 fine-grained 页。权限**一个都不用勾**——
 > 本工具只读公开仓库信息。
 
-不填也能用——只是 12 个 N 网模组会提示"需要设置 API key"，其余照常工作。
+不填也能用 —— 只是 N 网模组会提示"需要设置 API key"，其余照常工作。
 
 ---
 
@@ -75,7 +120,7 @@ GitHub Token 同理 —— 设置里有两个按钮：
 | **自动找到 Arsenal** | 探测 `%LOCALAPPDATA%\hd2arsenal\hd2a_data.json`，也会扫其他盘；找不到才让你选 |
 | **三个站点统一检查** | GitHub / Nexus / ayakamods |
 | **智能识别来源** | 替你判断每个 mod 在网上对应哪个页面，**实测算出 18/20** |
-| **网站优先级** | 多平台发布时按 **GitHub > N网 > ayakamods** 取（按你的要求） |
+| **网站优先级** | 多平台发布时按 **GitHub > N网 > ayakamods** 取（能直连下载的优先） |
 | **自动下载** | GitHub 的直链下载 + **sha256 校验** |
 | **「已下载」标记** | 下过的版本标出来，不重复催、也不重复下 |
 | **浏览器接力** | N网 / ayakamods 需要登录，工具开好**正确的下载页**并盯着下载夹，你点一下即可 |
@@ -340,7 +385,7 @@ python run.py --check --all    # 连已最新的也列出来
    超出会自动退回 `releases.atom`（只有版本号，没有下载直链）。
 5. **日期 vs 版本号**：ayakamods 上有些模组的"版本"栏填的是日期
    （如 `2026-09-24`）。这种情况版本无法比较，会显示"版本存疑"而**不会**误报有更新。
-6. **少数 mod 认不出来**（本机 20 个里有 1~2 个），右键手动指定即可。
+6. **少数 mod 认不出来**（实测 20 个里有 1~2 个），右键手动指定即可。
 7. **「已下载」只是引用，不搬运**：你把下载夹里的 ZIP 移走/删掉后，
    那一行会退回「有更新」并附一句提示 —— 这是故意的，避免误以为新版已就绪。
 
@@ -348,10 +393,15 @@ python run.py --check --all    # 连已最新的也列出来
 
 ## 环境要求
 
-- Windows
-- Python 3.9+（tkinter 随 Python 自带）
+- Windows 10 / 11（64 位）
+- **用 EXE 不需要 Python**；从源码跑需要 Python 3.9+（tkinter 随 Python 自带）
 
-> 想要免装 Python 的 EXE？见 `build_exe.py`。
+自己打包 EXE（用 PyInstaller）：
+
+```powershell
+pip install pyinstaller
+python build_exe.py      # 产物在 dist\HD2ModUpdater.exe
+```
 
 ---
 
@@ -359,25 +409,38 @@ python run.py --check --all    # 连已最新的也列出来
 
 ```
 hd2_updater/
-  util.py       HTTP（重试/节流）、版本比较、错误翻译
-  arsenal.py    定位并读取 Arsenal 库、猜版本、读 manifest 来源
+  util.py       HTTP（重试/节流）、版本比较、错误翻译、数据目录管理
+  arsenal.py    定位并只读 Arsenal 库、猜版本、还原变体名、读 manifest 来源
   providers.py  github_check / nexus_check / ayaka_check / ayaka_crawl
   matcher.py    搜索词生成、相似度、来源识别、版本核对消歧
   engine.py     Engine：解析来源 → 检查 → 汇总；下载
+  records.py    下载记录（哪个模组下了哪一版、文件在哪）
   gui.py        中文 tkinter 界面
   cli.py        命令行模式
+tools/
+  check_names.py          静态检查「用了但没定义」的名字
+  check_display_text.py   静态检查用户可见文案里残留的 markdown `**`
 run.py          入口
 ```
 
 改动后自测：
 
 ```powershell
-python run.py --check
+python run.py --check                    # 命令行跑一遍
+python tools/check_names.py              # 静态检查
+python tools/check_display_text.py       # 文案检查
 ```
+
+欢迎提 issue / PR。改动请尽量保持「只读 Arsenal」这一条底线。
 
 ---
 
+## 许可证
+
+[MIT](LICENSE)
+
 **免责声明**：与 Arrowhead Game Studios、Sony、Nexus Mods、ayakamods 均无关联。
 本工具只做更新检查与下载，不修改游戏文件——部署仍由 HD2 Arsenal 完成。
+请遵守各站点的服务条款；本工具不绕过登录、不抓取需要授权的下载。
 
 *版本 1.0.0*
