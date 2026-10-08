@@ -19,9 +19,16 @@ ZIP 它永远不认识。这个工具就是补这一块——**它只读 Arsenal
 
 N 网要求带 key 才能查，**免费申请、个人自用是允许的**：
 
-1. 打开 [nexusmods.com](https://www.nexusmods.com) → 登录 → 账号设置 → **API Keys**
-2. 复制底部的 **Personal API Key**
-3. 在工具里点 **「设置…」**，粘进去，保存
+1. 在工具里点 **「设置…」**
+2. 点 **「去获取 Nexus key」** 按钮 —— 会自动打开官方 API 页面
+3. 页面上找到 **Personal API Key**，点复制
+4. 粘回工具里，点 **「保存」**
+
+> 那个按钮指向 `nexusmods.com/users/myaccount?tab=api`（Nexus 官方帮助文档里
+> 指定的 API Access 页）。旁边还有「官方说明」按钮，指向其 API 使用政策。
+> 没登录的话要先登录。
+
+GitHub Token 同理 —— 设置里有 **「去获取 GitHub token」** 按钮。
 
 不填也能用——只是 12 个 N 网模组会提示"需要设置 API key"，其余照常工作。
 
@@ -64,6 +71,9 @@ HD2Runtime                    本地 0.28.1  →  线上 v0.30.0
 ```
 
 **双击一行** = 打开发布页　**右键** = 复制链接 / 浏览器下载 / 指定来源 / 打开下载目录
+
+**设置…** 里有 **「去获取 Nexus key」/「去获取 GitHub token」** 按钮，
+一键跳到官方页面拿密钥，不用自己找入口。
 
 ---
 

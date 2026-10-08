@@ -652,46 +652,137 @@ class SourceDialog(tk.Toplevel):
 class SettingsDialog(tk.Toplevel):
     """设置：N网 API key、GitHub token 等。"""
 
+    # 权威来源：Nexus 官方帮助文档《API Acceptable Use Policy》明确写
+    #   "All users have the ability to generate a Personal API key,
+    #    from the API Access page" —— 指向下面这个地址。
+    NEXUS_KEY_URL = "https://www.nexusmods.com/users/myaccount?tab=api"
+    NEXUS_HELP_URL = "https://help.nexusmods.com/article/114-api-acceptable-use-policy"
+    # GitHub 令牌页（细粒度令牌也能用，所以给的是令牌列表页）
+    GITHUB_TOKEN_URL = "https://github.com/settings/tokens"
+    GITHUB_HELP_URL = (
+        "https://docs.github.com/en/authentication/"
+        "keeping-your-account-and-data-secure/managing-your-personal-access-tokens"
+    )
+
     def __init__(self, master: App) -> None:
         super().__init__(master)
         self.title("设置")
         self.configure(bg=BG)
-        self.geometry("640x430")
+        self.geometry("700x520")
         self.resizable(False, False)
         self.master_app = master
         self.transient(master)
         self.grab_set()
 
-        ttk.Label(self, text="设置", style="Head.TLabel").pack(anchor="w", padx=16, pady=(14, 6))
+        ttk.Label(self, text="设置", style="Head.TLabel").pack(anchor="w", padx=16, pady=(14, 4))
 
-        ttk.Label(self, text="Nexus Mods 个人 API key（可选，但填了才能自动查 N网更新）",
-                  style="TLabel").pack(anchor="w", padx=16)
-        ttk.Label(self,
-                  text="到 nexusmods.com → 账号设置 → API Keys → 复制 Personal API Key。"
-                       "个人自用是允许的。",
-                  style="Dim.TLabel", wraplength=600).pack(anchor="w", padx=16)
-        e1 = tk.Entry(self, textvariable=master.var_nexus_key, bg=BG3, fg=FG,
-                      insertbackground=FG, relief="flat", show="•", font=("Consolas", 10))
-        e1.pack(fill="x", padx=16, pady=(4, 14), ipady=5)
+        tip = ("点右边「去获取」会在浏览器打开对应页面；拿到后复制粘贴到下面的框里，"
+               "再点「保存」即可。")
+        ttk.Label(self, text=tip, style="Dim.TLabel", wraplength=660).pack(anchor="w", padx=16)
 
-        ttk.Label(self, text="GitHub Token（可选，能提高查询配额）", style="TLabel").pack(anchor="w", padx=16)
-        ttk.Label(self, text="不填也行（每小时 60 次）。填了可到 5000 次/小时。",
-                  style="Dim.TLabel").pack(anchor="w", padx=16)
-        e2 = tk.Entry(self, textvariable=master.var_github_token, bg=BG3, fg=FG,
-                      insertbackground=FG, relief="flat", show="•", font=("Consolas", 10))
-        e2.pack(fill="x", padx=16, pady=(4, 14), ipady=5)
+        # ---------------- Nexus ----------------
+        self._section(
+            "① Nexus Mods 个人 API key",
+            "可选。填了才能自动检查 N 网模组的更新（你有 12 个 N 网模组）。\n"
+            "个人自用是 Nexus 官方允许的（见其 API Acceptable Use Policy）。",
+            self.var_key(master),
+            help_url=self.NEXUS_KEY_URL,
+            help_text="去获取 Nexus key",
+            help2=(self.NEXUS_HELP_URL, "官方说明"),
+            hint=("页面上找到 Personal API Key → 点复制。\n"
+                  "注意：不要给别人这个 key，它等同于你的账号凭据。"),
+        )
 
-        ttk.Label(self, text=f"下载保存位置：{tool_downloads_dir()}",
-                  style="Dim.TLabel", wraplength=600).pack(anchor="w", padx=16)
-        ttk.Label(self, text=f"下载文件夹（浏览器接力时监视）：{default_downloads_dir()}",
-                  style="Dim.TLabel", wraplength=600).pack(anchor="w", padx=16, pady=(2, 0))
+        # ---------------- GitHub ----------------
+        self._section(
+            "② GitHub Token",
+            "可选。不填也能用（未登录限额 60 次/小时）。\n"
+            "填了可提到 5000 次/小时，模组多的时候更稳。",
+            self.var_key2(master),
+            help_url=self.GITHUB_TOKEN_URL,
+            help_text="去获取 GitHub token",
+            help2=(self.GITHUB_HELP_URL, "官方说明"),
+            hint=("点 Generate new token → 权限**一个都不用勾**（只读公开仓库即可）"
+                  "→ 生成后复制那串 ghp_… 或 github_pat_…"),
+        )
 
+        # ---------------- 路径信息 ----------------
+        info = ttk.Frame(self)
+        info.pack(fill="x", padx=16, pady=(10, 0))
+        ttk.Label(info, text="下载保存位置：", style="Dim.TLabel").pack(anchor="w")
+        row1 = ttk.Frame(info)
+        row1.pack(fill="x")
+        ttk.Label(row1, text=tool_downloads_dir(), style="Dim.TLabel").pack(side="left")
+        ttk.Button(row1, text="打开", width=6,
+                   command=self._open_dl).pack(side="right")
+
+        ttk.Label(self, text="浏览器接力时监视的下载文件夹：",
+                  style="Dim.TLabel").pack(anchor="w", padx=16, pady=(8, 0))
+        ttk.Label(self, text=default_downloads_dir(), style="Dim.TLabel").pack(anchor="w", padx=16)
+
+        # ---------------- 按钮 ----------------
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=16, pady=16)
-        ttk.Button(btns, text="保存", style="Accent.TButton", command=self._save).pack(side="right")
+        ttk.Button(btns, text="保存", style="Accent.TButton",
+                   command=self._save).pack(side="right")
         ttk.Button(btns, text="取消", command=self.destroy).pack(side="right", padx=(0, 8))
         ttk.Button(btns, text="清空来源缓存（强制重新识别）",
                    command=self._clear).pack(side="left")
+
+    # 取 master 上的变量（两个 key 各一个输入框）
+    def var_key(self, master) -> tk.StringVar:
+        return master.var_nexus_key
+
+    def var_key2(self, master) -> tk.StringVar:
+        return master.var_github_token
+
+    def _section(self, title: str, desc: str, var, help_url: str = "",
+                 help_text: str = "", help2: tuple | None = None,
+                 hint: str = "") -> None:
+        """一个「标题 + 说明 + 输入框 + 跳转按钮」的标准区块。"""
+        box = ttk.Frame(self)
+        box.pack(fill="x", padx=16, pady=(12, 0))
+
+        ttk.Label(box, text=title, style="TLabel",
+                  font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(box, text=desc, style="Dim.TLabel", wraplength=660,
+                  justify="left").pack(anchor="w", pady=(2, 4))
+
+        # 输入框 + 右侧跳转按钮
+        row = ttk.Frame(box)
+        row.pack(fill="x")
+        ent = tk.Entry(row, textvariable=var, bg=BG3, fg=FG,
+                       insertbackground=FG, relief="flat", show="•",
+                       font=("Consolas", 10))
+        ent.pack(side="left", fill="x", expand=True, ipady=5)
+        if help_url:
+            ttk.Button(row, text=help_text, style="Accent.TButton",
+                       command=lambda u=help_url: self._open(u)).pack(side="left", padx=(6, 0))
+        if help2:
+            ttk.Button(row, text=help2[1],
+                       command=lambda u=help2[0]: self._open(u)).pack(side="left", padx=(4, 0))
+
+        if hint:
+            ttk.Label(box, text=hint, style="Dim.TLabel", wraplength=660,
+                      justify="left").pack(anchor="w", pady=(4, 0))
+
+    def _open(self, url: str) -> None:
+        if not open_in_browser(url):
+            # 打不开就显示出来让用户手动复制
+            self.clipboard_clear()
+            self.clipboard_append(url)
+            messagebox.showinfo(
+                "链接已复制",
+                f"没能自动打开浏览器。\n链接已复制到剪贴板，请手动粘贴打开：\n\n{url}",
+                parent=self,
+            )
+
+    def _open_dl(self) -> None:
+        d = tool_downloads_dir()
+        try:
+            os.startfile(d)  # noqa: S606
+        except Exception:  # noqa: BLE001
+            messagebox.showinfo("下载目录", d, parent=self)
 
     def _save(self) -> None:
         write_config({
