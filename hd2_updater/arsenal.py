@@ -175,6 +175,8 @@ def load_library(data_file: str) -> list[dict]:
             or ""
         )
         entry["auto_version"] = auto
+        # 「装的是哪个变体」—— 多变体 mod（如 Megapack 的 Rows 版）靠它挑对文件
+        entry["variant"] = local_variant(entry)
         if entry["uuid"] in overrides:
             entry["installed_version"] = str(overrides[entry["uuid"]])
             entry["version_is_manual"] = True
@@ -186,7 +188,6 @@ def load_library(data_file: str) -> list[dict]:
 
 
 def set_version_override(uuid: str, version: str) -> None:
-    """记住用户手动填的本地版本号。"""
     cfg = read_config()
     ov = cfg.get("version_overrides") or {}
     if version:
@@ -198,6 +199,42 @@ def set_version_override(uuid: str, version: str) -> None:
 
 def get_version_override(uuid: str) -> str:
     return str((read_config().get("version_overrides") or {}).get(uuid) or "")
+
+
+# Nexus 给下载目录起的名字末尾固定是
+#   " <modId> <version> <YYYY-MM-DDTHH-MMZ> <8位随机码>"
+# 去掉这一串（以及 Arsenal 自己加的 _AR######），剩下的就是**原始文件名的主体**。
+# 实测：加回 ".zip" 后与 Nexus API 的 file_name 精确一致（9 个里命中 7 个）。
+NEXUS_TAIL = re.compile(r"\s\d{3,7}\s+[0-9][0-9A-Za-z\.\-]*"
+                        r"\s+\d{4}-\d{2}-\d{2}T[0-9\-]+Z\s+\S+$")
+_AR_SUFFIX = re.compile(r"_AR\d+$")
+
+
+def local_variant(entry: dict) -> str:
+    """猜「用户装的这一个文件叫什么名字」——用于在多变体里挑对那一个。
+
+    为什么需要：同一个 mod 常有多个并行变体，比如 Vanilla Plus Megapack 有
+    普通版和 Rows 版（`Vanilla-Plus-Megapack-v40.zip` vs
+    `Vanilla-Plus-Megapack-Rows-v35.zip`）。它们**共用一个 mod 页面、
+    共用版本号序列**，只靠"版本号 + MAIN 分类"根本区分不出来 ——
+    实测就踩了：用户装的 Rows 版，工具却下成普通版给人家。
+
+    Nexus 下载的目录名里带着**原始文件名**，所以能还原出变体：
+        "Vanilla Plus Megapack - Rows 16294 35 2026-09-29T19-48Z KHd6InFpy_AR123"
+        → "Vanilla Plus Megapack - Rows"
+
+    返回空串表示"猜不出"（手动导入的、名字被改过等）——此时调用方
+    **不应该**替用户猜变体，而应当照旧走默认策略。
+    """
+    d = entry.get("dirname") or ""
+    if not d:
+        return ""
+    d = _AR_SUFFIX.sub("", d)
+    # 只有 Nexus 那套命名才敢还原（末尾有 编号+版本+时间戳+随机码）
+    if not NEXUS_TAIL.search(d):
+        return ""
+    base = NEXUS_TAIL.sub("", d).strip()
+    return base
 
 
 def guess_version(entry: dict) -> str:

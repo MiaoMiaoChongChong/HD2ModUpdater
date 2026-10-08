@@ -64,11 +64,15 @@ def github_headers(token: str = "") -> dict:
     return h
 
 
-def github_check(repo: str, token: str = "", asset_glob: str = "") -> dict:
+def github_check(repo: str, token: str = "", asset_glob: str = "",
+                 variant: str = "") -> dict:
     """查 GitHub 仓库最新 release。
 
     优先正式版 /releases/latest；若只有预发布版（latest 会 404），
     退一步列 releases 取最新，并标记 prerelease。
+
+    ``variant`` 是本地安装的变体名 —— 一个 release 里放多个变体时
+    （如 Megapack 的 Rows 版），靠它挑对资产而不是"取最大的"。
     """
     out = _empty("github")
     repo = (repo or "").strip().strip("/")
@@ -142,17 +146,166 @@ def github_check(repo: str, token: str = "", asset_glob: str = "") -> dict:
         cands.append(a)
 
     if cands:
-        # 同名多个时取最大的（通常是完整版）
-        pick = max(cands, key=lambda a: a.get("size") or 0)
+        # 挑哪个资产：**先认变体，再按大小**
+        #
+        # 原来一律"取最大的"，但同一个 release 常并行放多个变体：
+        #   Vanilla-Plus-Megapack-Rows-v35.zip (2,896,271)
+        #   Vanilla-Plus-Megapack-v35.zip      (2,890,903)   ← 只差 5KB
+        # 差这么点，谁大谁小纯属偶然 —— 按大小挑等于**随机换变体**。
+        # 实测踩过：用户装的 Rows 版会被换成普通版。
+        exact = [a for a in cands if _variant_in(str(a.get("name")), variant)]
+
+        if variant and not exact:
+            # 这一版里**没有**你装的变体。分两种情况，都不能静静换掉。
+            out["_glob"] = asset_glob
+            found = _github_variant_lookup(repo, variant, token, out)
+            out.pop("_glob", None)
+            if found:
+                # 已在历史发布里找到该变体的最后一版，out 已填好（含 pick_reason）
+                return out
+            # 历史里都找不到 → 用户那个变体命名对不上，老实退回默认并说明
+            pick = _pick_asset(cands, "")
+            _fill_asset(out, pick)
+            out["pick_reason"] = (
+                f"这个 mod 里找不到你装的「{variant}」变体，"
+                f"给的是最新发布里的「{out['asset_name']}」—— 装之前请确认"
+            )
+            out["note"] = ((out.get("note", "") + " " + out["pick_reason"]).strip())
+            return out
+
+        pick = max(exact, key=lambda a: a.get("size") or 0) if exact else _pick_asset(cands, "")
+        _fill_asset(out, pick)
+        if exact:
+            out["variant"] = variant
+            out["pick_reason"] = f"匹配到同变体「{variant}」"
+            if len(cands) > 1:
+                out["note"] = ((out.get("note", "") +
+                                f" 已按你装的变体「{variant}」挑中的包。").strip())
+        else:
+            if len(cands) > 1:
+                names = "、".join(str(a.get("name")) for a in cands[:4])
+                out["pick_reason"] = (
+                    f"认不出你装的是哪个变体，该发布有多个压缩包（{names}），"
+                    f"默认选了最大的 {out['asset_name']}"
+                )
+                out["note"] = (out.get("note", "") + " " + out["pick_reason"]).strip()
+            elif variant:
+                out["pick_reason"] = f"没匹配到变体「{variant}」，用默认挑选"
+    return out
+
+
+def _fill_asset(out: dict, pick: dict) -> None:
+    """把挑中的资产写进结果（三处都要用，抽出来免得漏字段）。"""
+    out["download_url"] = str(pick.get("browser_download_url") or "")
+    out["asset_name"] = str(pick.get("name") or "")
+    out["size"] = int(pick.get("size") or 0)
+    out["sha256"] = str(pick.get("digest") or "").replace("sha256:", "")
+
+
+def _asset_candidates(info: dict, asset_glob: str = "") -> list[dict]:
+    """从一次发布里筛出「像是 mod 包」的资产（排除源码包等）。"""
+    cands = []
+    for a in info.get("assets") or []:
+        name = str(a.get("name") or "")
+        low = name.lower()
+        if not low.endswith((".zip", ".7z", ".rar")):
+            continue
+        # 明显是源码/工具包就跳过
+        if any(k in low for k in ("source", "sdk", "template", "example", "-src")):
+            continue
+        if asset_glob and not _fnmatch(name, asset_glob):
+            continue
+        cands.append(a)
+    return cands
+
+
+def _variant_missing_note(variant: str) -> str:
+    return (f"你这个「{variant}」变体在这个新版里**没有**（作者可能已经停更该变体），"
+            f"下面给的是同一发布里的其它包，装之前先确认是不是你要的。")
+
+
+def _github_variant_lookup(repo: str, variant: str, token: str,
+                           out: dict) -> bool:
+    """新版里没有本地这个变体时，回头找「**最后一个还有该变体**的发布」。
+
+    为什么要这么做：实测踩过 Vanilla Plus Megapack —— 用户装的是 Rows 版，
+    作者在 v35 之后停更了 Rows，只发普通版。原来的代码会**静静地把普通版
+    塞给用户**，用户装完才发现自己的变体被换掉了。
+
+    正确做法是把话说清楚：
+      · 若"最后一个含该变体的发布"就是本地版本 → 你这个变体已是最新，
+        但要告诉用户"作者停更了这个变体"（是否迁移由用户决定）；
+      · 若它比本地新 → 就在该变体内更新。
+
+    返回 True 表示已经填好 out（调用方直接返回即可）。
+    """
+    try:
+        rels = http_get_json(
+            f"{GITHUB_API}/repos/{repo}/releases?per_page=100",
+            headers=github_headers(token),
+        )
+    except NetError:
+        return False
+    if not isinstance(rels, list):
+        return False
+
+    for r in rels:
+        if r.get("draft"):
+            continue
+        cands = _asset_candidates(r, out.get("_glob", ""))
+        if not cands:
+            continue
+        hit = [a for a in cands if _variant_in(str(a.get("name")), variant)]
+        if not hit:
+            continue
+        # 找到最后一个含该变体的发布
+        pick = max(hit, key=lambda a: a.get("size") or 0)
+        tag = str(r.get("tag_name") or r.get("name") or "")
+        out["version"] = tag
+        out["ok"] = True
+        out["prerelease"] = bool(r.get("prerelease")) or is_prerelease_text(tag)
+        out["updated"] = str(r.get("published_at") or "")[:19].replace("T", " ")
+        out["release_url"] = str(r.get("html_url") or "")
         out["download_url"] = str(pick.get("browser_download_url") or "")
         out["asset_name"] = str(pick.get("name") or "")
         out["size"] = int(pick.get("size") or 0)
         out["sha256"] = str(pick.get("digest") or "").replace("sha256:", "")
-        if len(cands) > 1:
-            names = "、".join(str(a.get("name")) for a in cands[:4])
-            out["note"] = (out.get("note", "") + f" 该发布有多个压缩包（{names}），"
-                           f"默认选了最大的 {out['asset_name']}").strip()
-    return out
+        out["variant"] = variant
+        out["pick_reason"] = (
+            f"「{variant}」停更在 {tag}（更新的发布里已经没有它了），"
+            f"这是该变体的最后一版 —— 要不要换成普通版由你决定"
+        )
+        out["note"] = (f"你的「{variant}」变体停更在这一版（更新的发布里已经没有它了）——"
+                       f"这是该变体的最后一版。要不要换成普通版由你决定。")
+        return True
+    return False
+
+
+def _variant_in(name: str, variant: str) -> bool:
+    """资产名里是否含这个变体名（把 Nexus 的空格写法也能对上 GitHub 的连字符写法）。
+
+    Nexus: "Vanilla Plus Megapack - Rows"
+    GitHub: "Vanilla-Plus-Megapack-Rows-v35.zip"
+    把两边都归一成"只留字母数字、转小写"再比，就都能命中。
+    """
+    if not variant:
+        return False
+    norm = lambda s: re.sub(r"[^a-z0-9]", "", (s or "").lower())
+    return norm(variant) in norm(name)
+
+
+def _pick_asset(cands: list[dict], variant: str = "") -> dict:
+    """在多个发布资产里挑一个：**先认变体，认不出再按大小**。
+
+    这是修「Rows 版被换成普通版」的关键 —— 多个变体的大小几乎一样，
+    "取最大的"实质上等于随机挑一个变体。
+    """
+    if variant:
+        same = [a for a in cands if _variant_in(str(a.get("name")), variant)]
+        if same:
+            # 同变体里若还有多个（不同版本），取最大的那个（通常是完整包）
+            return max(same, key=lambda a: a.get("size") or 0)
+    return max(cands, key=lambda a: a.get("size") or 0)
 
 
 def _github_via_atom(repo: str, out: dict, note: str = "") -> dict:
@@ -254,8 +407,71 @@ def nexus_headers(api_key: str) -> dict:
     }
 
 
-def nexus_check(mod_id: str, api_key: str) -> dict:
-    """查 Nexus 模组最新文件版本。需要个人 API key（免费申请）。"""
+def _pick_nexus_file(files: list[dict], variant: str = "") -> tuple[dict, str]:
+    """在 Nexus 的文件列表里挑出「该更新到的那一个」。
+
+    返回 (选中的文件, 为什么选它)。
+
+    优先级（每一层都是为了让"多变体 mod"别下错东西）：
+      1. 只要本地能看出变体名，就**严格挑同名变体**的最新版
+         （只看 MAIN / OLD_VERSION 里名字对得上的）
+      2. 对不上就退回"最新 MAIN"
+      3. 连 MAIN 都没有，就退回"最新的任何文件"
+
+    注意第 1 层故意**不跨变体兜底** —— 找不到同名变体时不能悄悄换成另一个，
+    否则就是本 bug 的重演；这种情况交给调用方去提示用户。
+    """
+    def ver_ts(f: dict) -> int:
+        return int(f.get("uploaded_timestamp") or 0)
+
+    def is_main(f: dict) -> bool:
+        return str(f.get("category_name") or "").upper() == "MAIN"
+
+    if variant:
+        v = variant.strip().lower()
+        # 同时比「显示名」和「原始文件名」，两种命名方式都能命中
+        same = [f for f in files
+                if v in str(f.get("name") or "").lower()
+                or v in str(f.get("file_name") or "").lower()]
+        if same:
+            pool = [f for f in same if is_main(f)] or same
+            pool = sorted(pool, key=ver_ts, reverse=True)
+            best = pool[0]
+            # 顺带看看：同一 mod 里有没有**比它还新**的别的变体？
+            # 有的话要提醒用户（作者可能停更了他用的那个变体），
+            # 但**绝不能**直接换成那个 —— 那就是本 bug 本身。
+            newest_any = sorted([f for f in files if is_main(f)] or files,
+                                key=ver_ts, reverse=True)[0]
+            if newest_any.get("file_id") != best.get("file_id"):
+                return best, (
+                    f"已按你装的变体「{variant}」选（{best.get('version')}）；"
+                    f"该 mod 还有更新的其它变体 {newest_any.get('version')}"
+                    f"「{newest_any.get('name')}」，要不要换由你决定"
+                )
+            return best, f"匹配到同变体「{variant}」"
+
+    main = [f for f in files if is_main(f)]
+    pool = main or files
+    pool = sorted(pool, key=ver_ts, reverse=True)
+
+    if variant:
+        # 没找到同变体 —— **绝不能**静静换成另一个（那就是本 bug 本身）。
+        # 明确说明"这不是你要的那个变体"，由界面去提醒用户。
+        return pool[0], (
+            f"这个 mod 现在**没有**「{variant}」变体了（作者可能已停更该变体）。"
+            f"下面是同一 mod 的其它变体「{pool[0].get('name')}」"
+            f"（v{pool[0].get('version')}），装之前请确认是不是你要的"
+        )
+    return pool[0], "最新 MAIN"
+
+
+def nexus_check(mod_id: str, api_key: str, variant: str = "") -> dict:
+    """查 Nexus 模组最新文件版本。需要个人 API key（免费申请）。
+
+    ``variant`` 是本地安装的**变体名**（见 arsenal.local_variant）。
+    同一个 mod 有多个并行变体时（如 Megapack 的 Rows 版），靠它挑对文件 ——
+    否则会把用户装的 Rows 版更新成普通版。
+    """
     out = _empty("nexus")
     mod_id = str(mod_id or "").strip()
     out["url"] = f"https://www.nexusmods.com/helldivers2/mods/{mod_id}"
@@ -292,15 +508,19 @@ def nexus_check(mod_id: str, api_key: str) -> dict:
     if not files:
         out["error"] = "该 mod 没有文件记录"
         return out
-    # 优先 MAIN 类，其次按上传时间取最新
-    main = [f for f in files if str(f.get("category_name") or "").upper() == "MAIN"]
-    pool = main or files
-    pool.sort(key=lambda f: f.get("uploaded_timestamp") or 0, reverse=True)
-    top = pool[0]
 
+    # 挑哪个文件：**先认变体，再认新旧**
+    #
+    # 为什么不能只看 MAIN + 最新：同一个 mod 常并行发布多个变体，它们共用
+    # 一个页面、共用版本号序列，只看"最新 MAIN"会**下错变体**。
+    # 实测踩过：Vanilla Plus Megapack 的 Rows 版（用户装的）被下成普通版 ——
+    # 两者都是 MAIN，只是 file_name 不同（`... - Rows ...` vs `... ...`）。
+    top, why = _pick_nexus_file(files, variant)
     out["ok"] = True
     out["version"] = str(top.get("version") or "")
     out["asset_name"] = str(top.get("file_name") or top.get("name") or "")
+    out["variant"] = str(top.get("name") or "")     # 变体名（Nexus 的「文件名」栏）
+    out["pick_reason"] = why
     out["size"] = int(top.get("size_kb") or 0) * 1024
     ts = top.get("uploaded_timestamp")
     if ts:

@@ -86,15 +86,22 @@ def source_key(entry: dict) -> str:
     return entry.get("uuid") or entry.get("label") or entry.get("dirname") or ""
 
 
-def check_one_source(src: dict, api_key: str, github_token: str) -> dict:
-    """查单个来源。"""
+def check_one_source(src: dict, api_key: str, github_token: str,
+                     variant: str = "") -> dict:
+    """查单个来源。
+
+    ``variant`` 是本地装的变体名（如 "Vanilla Plus Megapack - Rows"）——
+    当一个 mod 有并行变体时，靠它挑对文件，避免把 Rows 版更新成普通版。
+    只有该行自己的来源才用得到，所以一路透传给 provider。
+    """
     prov = (src.get("provider") or "").lower()
     ident = str(src.get("id") or "").strip()
     url = str(src.get("url") or "").strip()
     if prov == "github":
-        return providers.github_check(ident or url, github_token, src.get("asset", ""))
+        return providers.github_check(ident or url, github_token,
+                                      src.get("asset", ""), variant)
     if prov == "nexus":
-        return providers.nexus_check(ident or url, api_key)
+        return providers.nexus_check(ident or url, api_key, variant)
     if prov == "ayaka":
         return providers.ayaka_check(url or ident)
     out = providers._empty(prov or "?")
@@ -278,7 +285,6 @@ class Engine:
                 continue
             for src in self.resolved.get(key) or []:
                 jobs.append((entry, key, src))
-
         # 被选中但没有任何来源的模组：也要给出结果（未找到来源）
         entries_to_do = [
             e for e in self.library
@@ -294,7 +300,8 @@ class Engine:
         done = 0
         with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
             futs = {
-                ex.submit(check_one_source, src, self.api_key, self.github_token): (entry, key, src)
+                ex.submit(check_one_source, src, self.api_key, self.github_token,
+                          entry.get("variant") or ""): (entry, key, src)
                 for entry, key, src in jobs
             }
             for fut in as_completed(futs):

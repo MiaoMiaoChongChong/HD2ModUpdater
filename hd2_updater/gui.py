@@ -637,15 +637,26 @@ class App(tk.Tk):
         self._update_hint(rows)
 
     def _update_note(self, best: dict) -> str:
-        """「有更新」那一行右边写什么 —— 讲清**怎么拿到它**，别让人猜。"""
+        """「有更新」那一行右边写什么 —— 讲清**怎么拿到它**，别让人猜。
+
+        变体相关的提醒优先：如果这次挑的不是用户装的那个变体
+        （作者停更了他用的变体、或认不出），必须写在最显眼的位置 ——
+        实测踩过"Rows 版被悄悄换成普通版"，用户装完才发现变体被换了。
+        """
+        why = str(best.get("pick_reason") or "")
+        warn = ""
+        # 「匹配到同变体…」= 顺利用了你装的那个变体，不打扰；
+        # 其余提到变体的都要提醒（包括"有更新的其它变体"这种软提醒）。
+        if why and not why.startswith("匹配到同变体"):
+            warn = "⚠ 变体：" + why[:74] + "　"
         if best.get("download_url"):
-            return "双击这一行 = 直接下载（GitHub）"
+            return warn + "双击这一行 = 直接下载（GitHub）"
         prov = best.get("provider")
         if prov == "nexus":
-            return "双击这一行 = 打开文件页（登录后点 SLOW DOWNLOAD），下完自动收"
+            return warn + "双击这一行 = 打开文件页（登录后点 SLOW DOWNLOAD），下完自动收"
         if prov == "ayaka":
-            return "双击这一行 = 打开页面（登录后点 Download），下完自动收"
-        return "双击这一行 = 打开下载页"
+            return warn + "双击这一行 = 打开页面（登录后点 Download），下完自动收"
+        return warn + "双击这一行 = 打开下载页"
 
     def _auto_download_targets(self, rows: list[dict] | None = None) -> list[dict]:
         """还能自动下载的那些（有直链、且**这一版还没下过**的）。
