@@ -227,6 +227,24 @@ def github_search(query: str, token: str = "") -> list[dict]:
 NEXUS_API = "https://api.nexusmods.com/v1"
 
 
+def handoff_url(best: dict) -> str:
+    """「用浏览器取文件」该打开哪个地址 —— GUI 和命令行共用同一份判断。
+
+    各站点的差别（都是实测出来的，别随手改成统一取 file_url）：
+
+      · Nexus 用**深链** `?tab=files&file_id=…&nmm=1` —— 打开就停在要更新的
+        那个文件上，省掉"在文件列表里翻找"这一步。
+      · ayakamods **故意用模组页而不是 /download**：未登录时 /download 直接
+        返回 403 错误页，用户会以为工具坏了；模组页则好好地写着
+        "Log in or sign up to download"，登录后按钮即可点。
+      · GitHub 打开仓库/release 页（有直链的其实用「直接下载」更快）。
+    """
+    best = best or {}
+    if (best.get("provider") or "").lower() == "nexus":
+        return best.get("file_url") or best.get("url") or ""
+    return best.get("url") or best.get("release_url") or ""
+
+
 def nexus_headers(api_key: str) -> dict:
     return {
         "apikey": api_key,

@@ -10,6 +10,7 @@ from __future__ import annotations
 import sys
 
 from .arsenal import find_data_file, load_library, read_config
+from . import providers
 from .engine import (
     ST_BETA,
     ST_DOWNLOADED,
@@ -93,7 +94,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    直链 {best['download_url']}")
             print(f"          （{best.get('asset_name')}）")
         elif best.get("file_url"):
-            print(f"    取文件 {best['file_url']}")
+            # 和图形界面右键「用浏览器取文件（接力）」打开的是同一个地址
+            print(f"    取文件 {providers.handoff_url(best)}")
         if best.get("how"):
             print(f"    依据 {best['how'][:100]}")
         if st == ST_ERROR and best.get("error"):

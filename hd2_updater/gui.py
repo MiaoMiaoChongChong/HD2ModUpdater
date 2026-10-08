@@ -16,7 +16,7 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from . import APP_NAME, __version__, arsenal, matcher, util
+from . import APP_NAME, __version__, arsenal, matcher, providers, util
 from .arsenal import (
     find_data_file,
     load_library,
@@ -1143,16 +1143,10 @@ class App(tk.Tk):
     def _handoff_url(best: dict) -> str:
         """接力时该打开哪个地址。
 
-        N网 用深链（`?tab=files&file_id=…`）—— 打开就停在那个文件上，少找一步。
-        ayakamods **故意用模组页而不是 /download**：没登录时 /download 会直接
-        甩一个 403 错误页，用户会以为是工具坏了；模组页则好好地显示
-        「Log in or sign up to download」，登录后按钮就能点了。
-        GitHub 打开仓库/release 页。
+        逻辑放在 providers.handoff_url 里，**GUI 和命令行共用一份**，
+        免得哪天改了一处忘了另一处（各站点为什么不一样，见那边的注释）。
         """
-        prov = best.get("provider")
-        if prov == "nexus":
-            return best.get("file_url") or best.get("url") or ""
-        return best.get("url") or best.get("release_url") or ""
+        return providers.handoff_url(best)
 
     @staticmethod
     def _snapshot_dir(folder: str) -> dict:
