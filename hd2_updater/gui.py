@@ -657,8 +657,13 @@ class SettingsDialog(tk.Toplevel):
     #    from the API Access page" —— 指向下面这个地址。
     NEXUS_KEY_URL = "https://www.nexusmods.com/users/myaccount?tab=api"
     NEXUS_HELP_URL = "https://help.nexusmods.com/article/114-api-acceptable-use-policy"
-    # GitHub 令牌页（细粒度令牌也能用，所以给的是令牌列表页）
-    GITHUB_TOKEN_URL = "https://github.com/settings/tokens"
+    # GitHub 令牌页。依据 GitHub 官方文档《Managing your personal access tokens》：
+    # 该文档整篇唯一引用的令牌地址就是 settings/personal-access-tokens/new，
+    # 并明确 "recommends that you use fine-grained personal access tokens
+    # instead of personal access tokens (classic)"。
+    # （老的 settings/tokens 是 classic 页，仍可用但非推荐。）
+    GITHUB_TOKEN_URL = "https://github.com/settings/personal-access-tokens/new"
+    GITHUB_TOKEN_LIST_URL = "https://github.com/settings/personal-access-tokens"
     GITHUB_HELP_URL = (
         "https://docs.github.com/en/authentication/"
         "keeping-your-account-and-data-secure/managing-your-personal-access-tokens"
@@ -700,10 +705,13 @@ class SettingsDialog(tk.Toplevel):
             "填了可提到 5000 次/小时，模组多的时候更稳。",
             self.var_key2(master),
             help_url=self.GITHUB_TOKEN_URL,
-            help_text="去获取 GitHub token",
+            help_text="新建 GitHub token",
             help2=(self.GITHUB_HELP_URL, "官方说明"),
-            hint=("点 Generate new token → 权限**一个都不用勾**（只读公开仓库即可）"
-                  "→ 生成后复制那串 ghp_… 或 github_pat_…"),
+            hint=("会打开 GitHub 的「新建 fine-grained token」页（官方推荐的类型）。\n"
+                  "**权限一个都不用勾**（本工具只读公开仓库）→ 页面底部点 "
+                  "Generate token → 复制生成的 github_pat_… \n"
+                  "已有令牌想复用：点右侧「已建的令牌」。"),
+            help3=(self.GITHUB_TOKEN_LIST_URL, "已建的令牌"),
         )
 
         # ---------------- 路径信息 ----------------
@@ -738,7 +746,7 @@ class SettingsDialog(tk.Toplevel):
 
     def _section(self, title: str, desc: str, var, help_url: str = "",
                  help_text: str = "", help2: tuple | None = None,
-                 hint: str = "") -> None:
+                 help3: tuple | None = None, hint: str = "") -> None:
         """一个「标题 + 说明 + 输入框 + 跳转按钮」的标准区块。"""
         box = ttk.Frame(self)
         box.pack(fill="x", padx=16, pady=(12, 0))
@@ -758,6 +766,9 @@ class SettingsDialog(tk.Toplevel):
         if help_url:
             ttk.Button(row, text=help_text, style="Accent.TButton",
                        command=lambda u=help_url: self._open(u)).pack(side="left", padx=(6, 0))
+        if help3:
+            ttk.Button(row, text=help3[1],
+                       command=lambda u=help3[0]: self._open(u)).pack(side="left", padx=(4, 0))
         if help2:
             ttk.Button(row, text=help2[1],
                        command=lambda u=help2[0]: self._open(u)).pack(side="left", padx=(4, 0))

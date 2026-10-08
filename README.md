@@ -28,7 +28,15 @@ N 网要求带 key 才能查，**免费申请、个人自用是允许的**：
 > 指定的 API Access 页）。旁边还有「官方说明」按钮，指向其 API 使用政策。
 > 没登录的话要先登录。
 
-GitHub Token 同理 —— 设置里有 **「去获取 GitHub token」** 按钮。
+GitHub Token 同理 —— 设置里有两个按钮：
+
+- **「新建 GitHub token」** → `github.com/settings/personal-access-tokens/new`
+  （fine-grained，**GitHub 官方推荐**的类型）
+- **「已建的令牌」** → 同一页面，用来复用已有的令牌
+
+> 类型说明：GitHub 有 classic 与 fine-grained 两种令牌，两个页面都真实存在。
+> 本工具用的是官方推荐的 fine-grained 页。权限**一个都不用勾**——
+> 本工具只读公开仓库信息。
 
 不填也能用——只是 12 个 N 网模组会提示"需要设置 API key"，其余照常工作。
 
