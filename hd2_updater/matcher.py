@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from difflib import SequenceMatcher
 
 from . import providers
@@ -174,6 +175,21 @@ def search_terms(entry: dict) -> list[str]:
 # --------------------------------------------------------------------------
 # 本地 ayakamods 索引
 # --------------------------------------------------------------------------
+# 站点索引的保鲜期（天）。超过就自动重建。
+# 为什么是 7 天：ayakamods 上每天都有新模组上架，索引太旧会导致新模组
+# 识别不到；而重建要爬 500+ 页（约 90 秒），也不宜太频繁。
+INDEX_TTL_DAYS = 7
+
+# 防止并发抓取：后台自动刷新和用户点「识别来源」可能撞在一起
+_crawl_lock = threading.Lock()
+_crawl_state = {"running": False}
+
+
+def crawl_in_progress() -> bool:
+    """是否有抓取正在跑（供界面/引擎判断要不要等）。"""
+    return bool(_crawl_state.get("running"))
+
+
 def index_path() -> str:
     return os.path.join(app_data_dir(), "ayaka_index.json")
 
@@ -205,14 +221,65 @@ def index_age_days() -> float:
     return (time.time() - os.path.getmtime(p)) / 86400.0
 
 
+def index_is_stale() -> bool:
+    """索引是否需要重建（不存在或过期）。"""
+    return index_age_days() < 0 or index_age_days() > INDEX_TTL_DAYS
+
+
+def index_status_text() -> str:
+    """给界面用的一句话状态描述。"""
+    age = index_age_days()
+    if age < 0:
+        return "尚未建立（首次使用会自动建立）"
+    if age < 1:
+        return "刚刚更新过"
+    days = int(age)
+    if index_is_stale():
+        return f"已 {days} 天未更新，下次使用时会自动重建"
+    return f"{days} 天前更新（每 {INDEX_TTL_DAYS} 天自动更新）"
+
+
 def rebuild_index(progress=None) -> list[dict]:
-    """重新爬 ayakamods 列表建索引。"""
-    if progress:
-        progress("正在抓取 ayakamods 模组列表…")
-    items = providers.ayaka_crawl()
-    items = [i for i in items if i.get("slug")]
-    save_index(items)
-    return items
+    """重新爬 ayakamods 列表建索引。
+
+    并发安全：若已有抓取在跑，会等它结束后直接复用结果，不重复爬。
+    """
+    if not _crawl_lock.acquire(blocking=False):
+        if progress:
+            progress("已有索引更新在进行中，等它完成…")
+        _crawl_lock.acquire()          # 等对方做完
+        _crawl_lock.release()
+        return load_index()
+
+    try:
+        _crawl_state["running"] = True
+        if progress:
+            progress("正在抓取 ayakamods 模组列表（约 1~2 分钟）…")
+        items = providers.ayaka_crawl()
+        items = [i for i in items if i.get("slug")]
+        if items:
+            save_index(items)
+        return items
+    finally:
+        _crawl_state["running"] = False
+        _crawl_lock.release()
+
+
+def ensure_index(progress=None, force: bool = False) -> list[dict]:
+    """按需保证索引可用：不存在或过期就重建，否则直接用现成的。
+
+    这是给引擎调用的统一入口 —— 之前 engine 里那套 if 判断写错了层级，
+    导致"过期自动重建"永远不会触发（索引一旦建立就再没更新过）。
+    """
+    idx = load_index()
+    age = index_age_days()
+    if force or not idx or age < 0 or age > INDEX_TTL_DAYS:
+        why = "首次建立" if not idx else f"已 {int(age)} 天未更新"
+        if progress:
+            progress(f"站点索引需要更新（{why}）…")
+        fresh = rebuild_index(progress=progress)
+        return fresh or idx
+    return idx
 
 
 def unescape(text: str) -> str:

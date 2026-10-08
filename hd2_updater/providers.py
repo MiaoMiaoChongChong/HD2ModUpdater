@@ -7,6 +7,7 @@
     "ok": bool,
     "version": str,          # 线上最新版本号
     "url": str,              # 模组页地址
+    "file_url": str,         # 该版本所在的「文件页」深链（打开就停在那一个文件上）
     "download_url": str,     # 可直接下载的地址（GitHub 才有）
     "asset_name": str,       # 文件名
     "sha256": str,           # 校验和（有则给）
@@ -41,6 +42,7 @@ def _empty(provider: str) -> dict:
         "ok": False,
         "version": "",
         "url": "",
+        "file_url": "",
         "download_url": "",
         "asset_name": "",
         "sha256": "",
@@ -292,6 +294,17 @@ def nexus_check(mod_id: str, api_key: str) -> dict:
     out["note"] = "Nexus 下载需在浏览器登录后手动进行"
     # 记录精确的 file id，方便拼直达链接
     out["file_id"] = str(top.get("file_id") or "")
+    # 深链：打开就直接落在 Files 页签的这一个文件上，不用自己去列表里找。
+    # 格式依据（Nexus 官方/自家项目里都在用）：
+    #   https://www.nexusmods.com/{game}/mods/{mod_id}?tab=files&file_id={file_id}
+    # 末尾的 &nmm=1 是 Nexus 自己给「Mod Manager 下载」按钮用的参数
+    # （Vortex 生成的链接就带它），带上它页面会给出一键交给管理器下载的按钮，
+    # 正好能接上已注册了 nxm:// 协议的 Arsenal。
+    if out["file_id"]:
+        out["file_url"] = (
+            f"https://www.nexusmods.com/helldivers2/mods/{mod_id}"
+            f"?tab=files&file_id={out['file_id']}&nmm=1"
+        )
     return out
 
 
@@ -366,6 +379,11 @@ def ayaka_check(slug_or_url: str) -> dict:
     if re.search(r"Log in or sign up to download", html, re.I):
         out["needs_login"] = True
         out["note"] = "下载需要登录 ayakamods（未登录时站点不提供下载链接）"
+
+    # 下载页：登录后点「Download」会走这里。列出来方便开网页后少找一步。
+    # （未登录时访问它会返回 403，所以**只作为网址展示/复制**，不拿它当直链。）
+    if slug:
+        out["file_url"] = f"{AYAKA_BASE}/mods/{slug}/download"
 
     if not version and not updated:
         out["error"] = "页面结构变了，没读到版本信息（站点可能改版）"

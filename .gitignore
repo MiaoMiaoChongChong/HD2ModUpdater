@@ -11,10 +11,12 @@ build/
 dist/
 *.spec
 
-# 运行时数据（配置/缓存/下载，含个人 API key，绝不提交）
+# 运行时数据（配置/缓存/下载，含个人 API key 与本机路径，绝不提交）
 config.json
 sources.json
 ayaka_index.json
+downloads.json
+data_dir.txt
 last_result.json
 downloads/
 

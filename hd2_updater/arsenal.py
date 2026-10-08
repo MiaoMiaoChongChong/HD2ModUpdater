@@ -147,6 +147,8 @@ def load_library(data_file: str) -> list[dict]:
 
     # 布局信息也读出来（mods 目录可能在别处）
     mods_dir = data.get("userModsDir") or ""
+    # 用户手动修正过的本地版本（按 uuid 记），优先于自动推断
+    overrides = (read_config().get("version_overrides") or {})
     lib: list[dict] = []
     for m in data.get("modsLibrary") or []:
         path = m.get("path") or ""
@@ -166,14 +168,36 @@ def load_library(data_file: str) -> list[dict]:
             "enabled": bool(m.get("enabled")),
             "deployed": bool(m.get("deployed")),
         }
-        entry["installed_version"] = (
+        auto = (
             entry["nexus_version"]
             or guess_version(entry)
             or read_version_from_metadata(entry)
             or ""
         )
+        entry["auto_version"] = auto
+        if entry["uuid"] in overrides:
+            entry["installed_version"] = str(overrides[entry["uuid"]])
+            entry["version_is_manual"] = True
+        else:
+            entry["installed_version"] = auto
+            entry["version_is_manual"] = False
         lib.append(entry)
     return lib
+
+
+def set_version_override(uuid: str, version: str) -> None:
+    """记住用户手动填的本地版本号。"""
+    cfg = read_config()
+    ov = cfg.get("version_overrides") or {}
+    if version:
+        ov[uuid] = version
+    else:
+        ov.pop(uuid, None)
+    write_config({"version_overrides": ov})
+
+
+def get_version_override(uuid: str) -> str:
+    return str((read_config().get("version_overrides") or {}).get(uuid) or "")
 
 
 def guess_version(entry: dict) -> str:
@@ -227,7 +251,8 @@ def read_version_from_metadata(entry: dict) -> str:
     """从 mod 目录里的构建元数据文件挖版本号（手动导入的 mod 常用）。
 
     会看 *build*.json / *-build.json / hd2runtime.json / build-info.json
-    里的 version / revision / mod_version 等字段。
+    / provenance.json 里的 version / revision / mod_version 等字段，
+    以及 INSTALL.txt / README 里形如 "v1.2.3" 或 "(build 12345678)" 的痕迹。
     """
     path = entry.get("path") or ""
     if not path or not os.path.isdir(path):
@@ -236,14 +261,19 @@ def read_version_from_metadata(entry: dict) -> str:
     try:
         for n in os.listdir(path):
             low = n.lower()
-            if not low.endswith(".json"):
+            if not low.endswith((".json", ".txt", ".md")):
                 continue
             if ("build" in low or "runtime" in low or "info" in low
-                    or "provenance" in low):
+                    or "provenance" in low or "install" in low
+                    or "readme" in low or "manifest" in low):
                 names.append(n)
     except OSError:
         return ""
-    for n in names[:12]:
+
+    # 1) 先看结构化字段（更可靠）
+    for n in names:
+        if not n.lower().endswith(".json"):
+            continue
         try:
             with open(os.path.join(path, n), encoding="utf-8-sig") as f:
                 data = json.load(f)
@@ -257,9 +287,31 @@ def read_version_from_metadata(entry: dict) -> str:
             if isinstance(v, str) and v.strip():
                 s = v.strip()
                 # 排除明显是格式/内部版本的值
-                if s.lower() in ("1", "v1", "read_only", "readonly"):
+                if s.lower() in ("1", "v1", "read_only", "readonly", "2", "v2"):
                     continue
                 return s
+
+    # 2) 退一步：从文本里找 "v1.2.3" / "Revision 41" / "build 25327279"
+    import re
+    pats = [
+        r"\bv(\d+(?:\.\d+)+)\b",                       # v1.2.3
+        r"\brevision[:\s]+([rR]?\d+(?:\.\d+)*)\b",     # Revision R41 / revision 41
+        r"\bbuild[s]?[:\s]+(\d{5,})\b",                # build 25327279
+        r"\b(\d+\.\d+(?:\.\d+)+)\b",                   # 1.2.3
+    ]
+    for n in names:
+        if n.lower().endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(path, n), encoding="utf-8-sig",
+                      errors="replace") as f:
+                txt = f.read(20000)
+        except Exception:  # noqa: BLE001
+            continue
+        for p in pats:
+            m = re.search(p, txt, re.I)
+            if m:
+                return m.group(1)
     return ""
 
 
@@ -324,7 +376,68 @@ def default_downloads_dir() -> str:
 
 
 def tool_downloads_dir() -> str:
-    """本工具存放已下载 ZIP 的目录。"""
-    d = os.path.join(app_data_dir(), "downloads")
-    os.makedirs(d, exist_ok=True)
+    """本工具存放已下载 ZIP 的目录（可自定义，存 config.json）。"""
+    custom = str(read_config().get("tool_downloads_dir") or "").strip()
+    if custom:
+        d = os.path.abspath(os.path.expandvars(os.path.expanduser(custom)))
+    else:
+        d = os.path.join(app_data_dir(), "downloads")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        # 自定义路径不可用时退回默认，保证不崩
+        d = os.path.join(app_data_dir(), "downloads")
+        os.makedirs(d, exist_ok=True)
     return d
+
+
+def is_custom_tool_downloads() -> bool:
+    return bool(str(read_config().get("tool_downloads_dir") or "").strip())
+
+
+def browser_watch_dir() -> str:
+    """浏览器接力时**实际监视**的文件夹。
+
+    默认问注册表拿系统「下载」目录；用户可在设置里覆盖
+    （浏览器改过下载位置时必须能改，否则监视会落空）。
+    """
+    custom = str(read_config().get("browser_watch_dir") or "").strip()
+    if custom:
+        d = os.path.abspath(os.path.expandvars(os.path.expanduser(custom)))
+        if os.path.isdir(d):
+            return d
+    return default_downloads_dir()
+
+
+def is_custom_browser_watch() -> bool:
+    return bool(str(read_config().get("browser_watch_dir") or "").strip())
+
+
+def guess_browser_download_dirs() -> list[str]:
+    """常见浏览器的实际下载目录候选（供用户挑选，免去自己找）。
+
+    注意：浏览器把下载位置存在各自的 Preferences 里，编码/结构各版本不同，
+    这里只做**保守的已知位置推断**，不作为唯一来源 —— 用户仍可手动指定。
+    """
+    out: list[str] = []
+
+    def add(p: str) -> None:
+        if p and os.path.isdir(p) and os.path.normcase(p) not in {
+            os.path.normcase(x) for x in out
+        }:
+            out.append(p)
+
+    add(default_downloads_dir())
+
+    home = os.path.expanduser("~")
+    local = os.environ.get("LOCALAPPDATA") or ""
+    # 各浏览器配置目录里的默认下载位置（多数用户的默认就是系统的 Downloads，
+    # 这里补充几种常见的自定义习惯位置）
+    for rel in ("Downloads", "下载", os.path.join("Desktop", "下载")):
+        add(os.path.join(home, rel))
+        if local:
+            add(os.path.join(local, rel))
+    for drive in ("D:", "E:", "F:"):
+        for rel in ("Downloads", "下载", os.path.join("下载", "HD2")):
+            add(os.path.join(drive + os.sep, rel))
+    return out

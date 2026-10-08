@@ -255,9 +255,253 @@ def safe_filename(name: str) -> str:
     return s or "download"
 
 
-def app_data_dir() -> str:
-    """本工具的配置/缓存目录（放在用户数据区，避免与项目文件混在一起）。"""
+# --------------------------------------------------------------------------
+# 数据目录解析
+#
+# 优先级（从高到低）：
+#   1. 环境变量 HD2U_DATA_DIR     —— 便于脚本/便携用法，优先级最高
+#   2. 指针文件里的路径            —— 用户在「设置…」里自定义的目标
+#   3. 默认位置 %LOCALAPPDATA%\hd2-updater
+#
+# 为什么要"指针文件"：config.json 本身就在数据目录里，若想从 config 读
+# 自定义路径就会先有鸡还是先有蛋。所以指针单独放默认位置、只存一行路径，
+# 真正的配置仍在（可能已搬走的）数据目录里。
+# --------------------------------------------------------------------------
+ENV_DATA_DIR = "HD2U_DATA_DIR"
+DEFAULT_DIRNAME = "hd2-updater"
+POINTER_FILENAME = "data_dir.txt"
+
+
+def default_data_dir() -> str:
+    """默认数据目录（未自定义时用的那个）。"""
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    d = os.path.join(base, "hd2-updater")
-    os.makedirs(d, exist_ok=True)
-    return d
+    return os.path.join(base, DEFAULT_DIRNAME)
+
+
+def pointer_path() -> str:
+    """指针文件路径（始终在默认位置）。"""
+    return os.path.join(default_data_dir(), POINTER_FILENAME)
+
+
+def _read_pointer() -> str:
+    try:
+        with open(pointer_path(), encoding="utf-8-sig") as f:
+            p = f.read().strip()
+        return p
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def set_data_dir(path: str) -> None:
+    """把数据目录指向 path。传空字符串 = 恢复默认。
+
+    只写指针文件，**不搬数据** —— 搬家由 GUI 负责（它要能报进度/报错）。
+    """
+    ptr = pointer_path()
+    os.makedirs(os.path.dirname(ptr), exist_ok=True)
+    if not path:
+        try:
+            os.remove(ptr)
+        except OSError:
+            pass
+        return
+    with open(ptr, "w", encoding="utf-8") as f:
+        f.write(os.path.abspath(os.path.expandvars(os.path.expanduser(path))))
+
+
+def current_data_dir() -> str:
+    """当前生效的数据目录（不创建）。"""
+    env = os.environ.get(ENV_DATA_DIR)
+    if env and env.strip():
+        return os.path.abspath(os.path.expandvars(os.path.expanduser(env.strip())))
+    p = _read_pointer()
+    if p:
+        return os.path.abspath(os.path.expandvars(os.path.expanduser(p)))
+    return default_data_dir()
+
+
+def is_custom_data_dir() -> bool:
+    """当前是否用了自定义目录。"""
+    return os.path.normcase(current_data_dir()) != os.path.normcase(default_data_dir())
+
+
+# 数据目录回退时的告警（供界面提示用户，只报一次）
+_last_fallback_reason = ""
+
+
+def take_fallback_reason() -> str:
+    """取走（并清空）上次回退的原因，供界面提示。"""
+    global _last_fallback_reason
+    r = _last_fallback_reason
+    _last_fallback_reason = ""
+    return r
+
+
+def _dir_usable(d: str) -> tuple[bool, str]:
+    """检查目录是否真的能用（存在或可创建 + 可写）。"""
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError as e:
+        return False, f"无法创建/访问：{e.strerror or e}"
+    if not os.path.isdir(d):
+        return False, "不是一个目录"
+    if not os.access(d, os.W_OK):
+        return False, "目录不可写"
+    return True, ""
+
+
+def read_tool_config() -> dict:
+    """读工具自己的 config.json（只读，容错）。
+
+    注意：不要和 arsenal.read_config() 混用 —— 那个是同一个文件，
+    这里提供一个不依赖 arsenal 模块的入口，避免 util 反向依赖 arsenal。
+    """
+    import json
+    p = os.path.join(app_data_dir(), "config.json")
+    try:
+        with open(p, encoding="utf-8-sig") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def read_config_dismissed() -> bool:
+    """用户是否已忽略过"填令牌"的提示（避免反复打扰）。"""
+    return bool(read_tool_config().get("token_hint_dismissed"))
+
+
+def app_data_dir() -> str:
+    """本工具的配置/缓存目录（实际使用位置，可能是自定义的）。
+
+    **保证不抛异常**：自定义位置不可用（U 盘拔了、盘符不存在、权限不足、
+    指针文件被改坏）时，自动回退到默认位置，并记下原因供界面提示一次。
+    这条"永不崩"的保证很重要 —— 否则用户会看到莫名的 FileNotFoundError，
+    完全联想不到是数据目录的问题。
+    """
+    global _last_fallback_reason
+    wanted = current_data_dir()
+
+    ok, why = _dir_usable(wanted)
+    if ok:
+        return wanted
+
+    # 回退到默认位置
+    fallback = default_data_dir()
+    if os.path.normcase(fallback) != os.path.normcase(wanted):
+        fok, _fwhy = _dir_usable(fallback)
+        if fok:
+            _last_fallback_reason = f"原先的数据目录不可用（{wanted}）：{why}，已临时改用默认位置"
+            return fallback
+
+    # 连默认位置都不行 —— 退到临时目录，至少别崩
+    import tempfile
+    tmp = os.path.join(tempfile.gettempdir(), DEFAULT_DIRNAME)
+    os.makedirs(tmp, exist_ok=True)
+    _last_fallback_reason = (
+        f"数据目录不可用（{wanted}：{why}），默认位置也建不了，"
+        f"已临时改用 {tmp}（数据不会被长期保存）"
+    )
+    return tmp
+
+
+# 会被搬移的文件/目录（相对数据目录）
+MOVE_ITEMS = ("config.json", "sources.json", "ayaka_index.json", "downloads",
+              "downloads.json")
+
+
+def existing_conflicts(new_dir: str) -> list[str]:
+    """列出目标目录里**已存在、且会被覆盖**的项（搬移前提示用户用）。"""
+    out = []
+    for name in MOVE_ITEMS:
+        src = os.path.join(current_data_dir(), name)
+        dst = os.path.join(new_dir, name)
+        if os.path.exists(src) and os.path.exists(dst):
+            out.append(name)
+    return out
+
+
+def move_data_dir(
+    new_dir: str,
+    progress=None,
+    allow_overwrite: bool = False,
+) -> tuple[bool, str]:
+    """把数据从当前目录搬到 new_dir。
+
+    返回 (是否成功, 说明)。**先复制、校验通过后再删源**，避免搬一半丢数据。
+    搬完顺带把指针改过去。
+
+    allow_overwrite=False（默认）时，若目标目录已有同名文件，**直接拒绝并
+    列出冲突项** —— 避免静默覆盖掉用户以前的备份或别的工具的数据。
+    """
+    import shutil
+
+    old = current_data_dir()
+    new = os.path.abspath(os.path.expandvars(os.path.expanduser(new_dir)))
+    if os.path.normcase(old) == os.path.normcase(new):
+        return False, "新位置和当前是同一个目录"
+
+    # 防呆：不允许选中旧目录的子目录（会自我嵌套）
+    try:
+        if os.path.normcase(os.path.commonpath([old, new])) == os.path.normcase(old):
+            return False, "新位置不能是当前目录的子目录"
+    except ValueError:
+        pass  # 不同盘，commonpath 会抛错 —— 那正好说明安全
+
+    try:
+        os.makedirs(new, exist_ok=True)
+    except OSError as e:
+        return False, f"建不了目标目录：{e}"
+
+    ok, why = _dir_usable(new)
+    if not ok:
+        return False, f"目标目录不可用：{why}"
+
+    # 防呆：目标已有同名文件 —— 不静默覆盖
+    conflicts = existing_conflicts(new)
+    if conflicts and not allow_overwrite:
+        return False, (
+            "目标目录里已经有同名文件，会被覆盖：\n  "
+            + "\n  ".join(conflicts)
+            + "\n\n如果那是你以前的备份，请换一个空目录；"
+              "确实要覆盖的话，请重新操作并确认覆盖。"
+        )
+
+    moved: list[str] = []
+    for name in MOVE_ITEMS:
+        src = os.path.join(old, name)
+        if not os.path.exists(src):
+            continue
+        dst = os.path.join(new, name)
+        try:
+            if progress:
+                progress(f"搬移 {name} …")
+            if os.path.isdir(src):
+                if os.path.exists(dst):
+                    shutil.rmtree(dst, ignore_errors=True)
+                shutil.copytree(src, dst)
+            else:
+                shutil.copy2(src, dst)
+            # 校验：文件大小一致才算成功
+            if os.path.isfile(src):
+                if os.path.getsize(src) != os.path.getsize(dst):
+                    return False, f"{name} 复制后大小不一致，已中止（原数据未删）"
+            moved.append(name)
+        except Exception as e:  # noqa: BLE001
+            return False, f"搬移 {name} 失败：{e}（原数据未删）"
+
+    # 全部复制成功，才删源
+    for name in moved:
+        src = os.path.join(old, name)
+        try:
+            if os.path.isdir(src):
+                shutil.rmtree(src, ignore_errors=True)
+            else:
+                os.remove(src)
+        except OSError:
+            pass  # 删不掉也无妨，指针已改，不影响使用
+
+    set_data_dir(new)
+    if progress:
+        progress("完成")
+    return True, f"已搬运 {len(moved)} 项到 {new}"

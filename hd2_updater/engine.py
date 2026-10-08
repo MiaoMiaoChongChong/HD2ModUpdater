@@ -13,7 +13,7 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from . import matcher, providers
+from . import matcher, providers, records
 from .arsenal import (
     load_library,
     tool_downloads_dir,
@@ -29,6 +29,7 @@ ST_UNKNOWN = "unknown"      # 版本无法比较
 ST_ERROR = "error"          # 查询失败
 ST_NO_SOURCE = "nosource"   # 查过了，但没找到来源
 ST_UNCHECKED = "unchecked"  # 还没检查（刚打开程序时的初始状态）
+ST_DOWNLOADED = "downloaded"  # 有更新，而且这个版本**已经下过了**
 
 
 def sources_path() -> str:
@@ -104,7 +105,7 @@ def check_one_source(src: dict, api_key: str, github_token: str) -> dict:
 def evaluate(entry: dict, checks: list[dict]) -> dict:
     """把多个来源的查询结果汇总成一个结论。"""
     installed = entry.get("installed_version") or ""
-    stable_upd, beta_upd, oks, errs = [], [], [], []
+    stable_upd, beta_upd, oks, errs, unknown = [], [], [], [], []
     for c in checks:
         if not c.get("ok"):
             errs.append(c)
@@ -118,7 +119,17 @@ def evaluate(entry: dict, checks: list[dict]) -> dict:
         elif v in ("same", "older"):
             oks.append(c)
         else:
-            errs.append({**c, "ok": False, "error": "版本号格式无法比较"})
+            # 比不出来 —— 分两种情况给出**可操作**的说明
+            online = c.get("version", "") or "?"
+            if not installed:
+                why = (f"本地没记录版本号，没法比较（线上是 {online}）。"
+                       f"要么是你手动导入的 mod 本身没写版本，"
+                       f"要么是安装目录名里没有版本信息。")
+            else:
+                why = (f"两边格式不同，没法比大小：本地「{installed}」vs 线上「{online}」。"
+                       f"大多是站点把「版本」栏填成了日期。")
+            c2 = {**c, "ok": False, "error": why, "unknown_ver": True}
+            unknown.append(c2)
 
     def rank(c: dict) -> tuple:
         # 能直接下载的优先，其次按站点优先级
@@ -136,9 +147,16 @@ def evaluate(entry: dict, checks: list[dict]) -> dict:
     elif oks:
         best = sorted(oks, key=rank)[0]
         status = ST_OK
+    elif unknown and not errs:
+        # 纯粹是"版本比不了"（不是网络失败）—— 单列一类，别混进"查询失败"
+        best = unknown[0]
+        status = ST_UNKNOWN
     elif errs:
         best = errs[0]
         status = ST_ERROR
+    elif unknown:
+        best = unknown[0]
+        status = ST_UNKNOWN
     else:
         best = None
         status = ST_NO_SOURCE
@@ -202,15 +220,20 @@ class Engine:
 
     # ------------------------------------------------------- 解析来源
     def resolve_sources(self, force_search: bool = False) -> None:
-        """给每个 mod 找出来源。已手工确认过的优先用。"""
+        """给每个 mod 找出来源。已手工确认过的优先用。
+
+        站点索引过期（默认 7 天）会**自动重建**，不需要用户手动点。
+        """
         saved = load_sources()
-        index = matcher.load_index() if self.use_search else []
-        if self.use_search and (force_search or not index):
-            age = matcher.index_age_days()
-            if force_search or age < 0 or age > 14:
-                self._log("更新 ayakamods 索引…")
-                index = matcher.rebuild_index(progress=self._log)
-                self._log(f"索引里 {len(index)} 个模组")
+        index: list[dict] = []
+        if self.use_search:
+            # ensure_index 内部会判断：不存在、或超过保鲜期 → 自动重建。
+            # （旧代码把「过期检查」写在了「索引不存在」的分支里，是死代码，
+            #   导致索引建好后再也不更新。）
+            index = matcher.ensure_index(progress=self._log, force=force_search)
+            if index:
+                self._log(f"使用站点索引（{matcher.index_status_text()}，"
+                          f"{len(index)} 个模组）")
 
         total = len(self.library)
         for i, entry in enumerate(self.library, 1):
@@ -241,17 +264,30 @@ class Engine:
         self._log(f"来源解析完成：{sum(1 for v in self.resolved.values() if v)}/{total} 个已识别")
 
     # ---------------------------------------------------------- 检查更新
-    def check(self) -> list[dict]:
-        """对所有已识别来源的 mod 检查更新（并发）。"""
+    def check(self, only_keys: set[str] | None = None) -> list[dict]:
+        """对已识别来源的 mod 检查更新（并发）。
+
+        only_keys 非空时，**只检查这些 key 对应的模组**，其余不动作
+        （用于「只检查未检查的」这类增量场景，免得为一个模组重跑全库）。
+        返回值仍只有被检查的那些模组的结果。
+        """
         jobs = []
         for entry in self.library:
             key = source_key(entry)
+            if only_keys is not None and key not in only_keys:
+                continue
             for src in self.resolved.get(key) or []:
                 jobs.append((entry, key, src))
 
+        # 被选中但没有任何来源的模组：也要给出结果（未找到来源）
+        entries_to_do = [
+            e for e in self.library
+            if only_keys is None or source_key(e) in only_keys
+        ]
+
         total = len(jobs)
         if not total:
-            self.results = [self._result_for(e, []) for e in self.library]
+            self.results = [self._result_for(e, []) for e in entries_to_do]
             return self.results
 
         by_key: dict[str, list[dict]] = {k: [] for k in self.resolved}
@@ -280,7 +316,11 @@ class Engine:
                     f"检查中：{entry.get('label') or entry['dirname']}（{src.get('provider')}）",
                 )
 
-        self.results = [self._result_for(e, by_key.get(source_key(e), [])) for e in self.library]
+        # 只返回这次真正查了的模组（增量模式下不要覆盖其他结果）
+        self.results = [
+            self._result_for(e, by_key.get(source_key(e), []))
+            for e in entries_to_do
+        ]
         return self.results
 
     def _result_for(self, entry: dict, checks: list[dict]) -> dict:
@@ -318,10 +358,47 @@ class Engine:
 
 def summarize(results: list[dict]) -> dict:
     """统计各状态数量。"""
-    n = {ST_UPDATE: 0, ST_BETA: 0, ST_OK: 0, ST_ERROR: 0, ST_UNKNOWN: 0, ST_NO_SOURCE: 0}
+    n = {ST_UPDATE: 0, ST_BETA: 0, ST_OK: 0, ST_ERROR: 0, ST_UNKNOWN: 0,
+         ST_NO_SOURCE: 0, ST_DOWNLOADED: 0}
     for r in results:
         n[r["status"]] = n.get(r["status"], 0) + 1
     return n
+
+
+# --------------------------------------------------------------------------
+# 「这一版我下过了」这层状态
+# --------------------------------------------------------------------------
+def apply_download_records(rows: list[dict]) -> list[dict]:
+    """把下载记录叠加到检查结果上，**返回新列表，不改原数据**。
+
+    规则（重要，别改坏）：
+      · 记的版本 == 现在线上版本，且文件还在 → 标成「已下载」
+      · 版本对不上（线上又更新了）→ 保持「有更新」，
+        否则用户会以为新版本也下好了
+      · 版本对得上但文件被移走/删了 → 保持「有更新」，
+        但附一句说明（很可能已经导入 Arsenal 了）
+
+    之所以放在渲染前算而不是塞进 evaluate()：下载记录会**独立于检查结果变化**
+    （用户手动删了文件、或线上又发新版），每次渲染都得重新判断一次。
+    """
+    out: list[dict] = []
+    for r in rows:
+        if r.get("status") != ST_UPDATE:
+            out.append(r)
+            continue
+        best = r.get("best") or {}
+        ver = str(best.get("version") or "")
+        key = source_key(r.get("entry") or {})
+        rec = records.match(key, ver)
+        if rec:
+            out.append({**r, "status": ST_DOWNLOADED, "downloaded": rec})
+            continue
+        gone = records.file_missing(key, ver)
+        if gone:
+            out.append({**r, "prev_download": gone})
+            continue
+        out.append(r)
+    return out
 
 
 # --------------------------------------------------------------------------
