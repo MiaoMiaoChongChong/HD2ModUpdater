@@ -95,7 +95,7 @@ HOVER_TIPS = {
               "下好的条目会在列表里变成「已下载」，不会重复下第二次。\n\n"
               "N网 / ayakamods 这一栏下不了 —— 它们要求你先登录、\n"
               "而且必须由你亲自点一下下载按钮（站点设计如此）。\n"
-              "那些请用右键「用浏览器取文件（接力）」。",
+              "那些**双击对应那一行**即可：会打开下载页，下完自动收回来。",
     "btn_index": "重建站点索引 = 把 ayakamods 上全部 HD2 模组的清单爬下来，\n"
                  "存成本地索引（约 500 个，需 1~2 分钟）。\n\n"
                  "为什么需要：ayakamods 不提供搜索接口（对脚本返回 403），\n"
@@ -214,6 +214,11 @@ class App(tk.Tk):
         self.worker: threading.Thread | None = None
         self._row_widgets: list[dict] = []
         self._last_settings_dialog = None   # 搬移完成后要回调它收尾
+        # 接力用**独立**的工作线程，不占 self.worker —— 否则接力那 15 分钟里，
+        # 「检查更新」「识别来源」会因为"worker 还活着"而**静默什么都不做**，
+        # 用户点了没反应，最难查的一类 bug。
+        self._relay_cancel: threading.Event | None = None
+        self._relay_thread: threading.Thread | None = None
 
         self.var_arsenal = tk.StringVar(value="（正在探测…）")
         self.var_nexus_key = tk.StringVar()
@@ -391,8 +396,9 @@ class App(tk.Tk):
         bot.pack(fill="x")
         ttk.Label(bot, textvariable=self.var_status, style="Dim.TLabel").pack(side="left")
         ttk.Label(bot, textvariable=self.var_summary, style="Dim.TLabel").pack(side="right")
-        tip = ("提示：双击一行 = 打开它的发布页（「已下载」的则打开已下好的文件）；"
-               "右键还有「用浏览器取文件（接力）」等操作。")
+        tip = ("提示：双击一行就能干活 —— 有更新的会直接下载（GitHub），"
+               "或打开下载页并自动把文件收回来（N网 / ayakamods）；"
+               "已下载的则打开那个 ZIP。右键还有更多操作。")
         ttk.Label(self, text=tip, style="Dim.TLabel").pack(anchor="w", padx=14, pady=(0, 6))
 
         # 右键菜单
@@ -400,11 +406,12 @@ class App(tk.Tk):
                             activebackground=ACCENT, activeforeground="#1b1d21")
         self.menu.add_command(label="只检查这一个", command=self._check_this_one)
         self.menu.add_separator()
-        self.menu.add_command(label="用浏览器取文件（接力）", command=self._ctx_browser)
-        self.menu.add_command(label="直接下载这个（仅 GitHub）", command=self._ctx_download)
+        self.menu.add_command(label="下载 / 打开下载页（= 双击这一行）",
+                              command=self._on_row_activate)
+        self.menu.add_command(label="只在浏览器打开，不自动收文件",
+                              command=self._ctx_open)
         self.menu.add_command(label="打开已下载的文件", command=self._ctx_open_file)
         self.menu.add_separator()
-        self.menu.add_command(label="打开发布页", command=self._ctx_open)
         self.menu.add_command(label="复制链接", command=self._ctx_copy)
         self.menu.add_command(label="指定来源…", command=self._ctx_set_source)
         self.menu.add_separator()
@@ -605,13 +612,13 @@ class App(tk.Tk):
     def _update_note(self, best: dict) -> str:
         """「有更新」那一行右边写什么 —— 讲清**怎么拿到它**，别让人猜。"""
         if best.get("download_url"):
-            return "可自动下载"
+            return "双击这一行 = 直接下载（GitHub）"
         prov = best.get("provider")
         if prov == "nexus":
-            return "N网：右键「用浏览器取文件」→ 登录后点 SLOW DOWNLOAD"
+            return "双击这一行 = 打开文件页（登录后点 SLOW DOWNLOAD），下完自动收"
         if prov == "ayaka":
-            return "ayakamods：右键「用浏览器取文件」→ 登录后点 Download"
-        return "需在浏览器登录后下载"
+            return "双击这一行 = 打开页面（登录后点 Download），下完自动收"
+        return "双击这一行 = 打开下载页"
 
     def _auto_download_targets(self, rows: list[dict] | None = None) -> list[dict]:
         """还能自动下载的那些（有直链、且**这一版还没下过**的）。
@@ -730,12 +737,23 @@ class App(tk.Tk):
             arsenal.write_config({"token_hint_dismissed": True})
 
     # ------------------------------------------------------------ 识别来源
+    def _busy_guard(self) -> bool:
+        """有检查/识别在跑时返回 True 并**给出提示**。
+
+        原来是 `if self.worker...: return` —— 静默什么都不做，用户点了没反应，
+        最容易误判成"坏了"。哪怕只是个防御性分支，也要说一句话。
+        """
+        if self.worker and self.worker.is_alive():
+            self.var_status.set("正在忙（检查或识别进行中），请等它跑完再点。")
+            return True
+        return False
+
     def _find_sources(self) -> None:
         """只做来源识别（不查版本），结果保存下来。"""
         if not self.data_file:
             messagebox.showwarning("先选位置", "还没找到 Arsenal 模组库。")
             return
-        if self.worker and self.worker.is_alive():
+        if self._busy_guard():
             return
         self.btn_find.configure(state="disabled", text="识别中…")
         self.btn_check.configure(state="disabled")
@@ -772,7 +790,7 @@ class App(tk.Tk):
         if not self.data_file:
             messagebox.showwarning("先选位置", "还没找到 Arsenal 模组库。")
             return
-        if self.worker and self.worker.is_alive():
+        if self._busy_guard():
             return
         incremental = bool(only_keys)
         label = "检查中…" if not incremental else "检查中…"
@@ -837,7 +855,7 @@ class App(tk.Tk):
         w = self._selected()
         if not w:
             return
-        if self.worker and self.worker.is_alive():
+        if self._busy_guard():
             return
         self._start_check(only_keys={source_key(w["entry"])})
 
@@ -985,8 +1003,10 @@ class App(tk.Tk):
         targets = self._auto_download_targets()
         if not targets:
             messagebox.showinfo("没有可自动下载的",
-                                "有更新的模组里没有可直接下载的。\n\n"
-                                "N网 / ayakamods 需要登录，请用右键「用浏览器取文件」。")
+                                "有更新的模组里没有可直接下载的（只有 GitHub 能直连下载）。\n\n"
+                                "N网 / ayakamods 需要登录，而且必须你亲自点一下下载按钮。\n"
+                                "**双击列表里那几行**就会打开对应的下载页，"
+                                "下完的文件会自动收进工具的下载夹。")
             return
         self.btn_dl.configure(state="disabled", text="下载中…")
         dest = tool_downloads_dir()
@@ -1037,16 +1057,34 @@ class App(tk.Tk):
             finally:
                 self.menu.grab_release()
 
-    def _on_row_activate(self, _ev) -> None:
-        """双击一行：已下载的打开文件；其余打开它的发布页。"""
+    def _on_row_activate(self, _ev=None) -> None:
+        """双击一行 = 直接干这件事，不用先去想"该用哪个菜单"。
+
+        · 已下载 → 打开那个 ZIP
+        · 有更新的（且能自动下载）→ 直接下载
+        · 需要登录的（N网 / ayakamods）→ 走接力：开页面 + 盯着下载夹
+        · 其它情况（已最新 / 没来源 / 查失败）→ 打开它的发布页
+
+        为什么双击=接力而不是只开网页：用户看到的是「有更新」这一行，
+        最自然的动作就是双击它。原来只开网页、不盯下载夹，等于"帮了一半点"，
+        文件下完还得自己去搬。现在双击就把接力整件事做完。
+        """
         w = self._selected()
         if not w:
             return
         row = w["row"]
-        if row.get("status") == ST_DOWNLOADED:
+        st = row.get("status")
+        best = (row.get("best") or {})
+
+        if st == ST_DOWNLOADED:
             self._ctx_open_file()
             return
-        best = (row.get("best") or {})
+        if st == ST_UPDATE and best.get("download_url"):
+            self._ctx_download()
+            return
+        if st in (ST_UPDATE, ST_BETA) and self._handoff_url(best):
+            self._ctx_browser()
+            return
         url = self._handoff_url(best) or best.get("url") or best.get("release_url")
         if url:
             open_in_browser(url)
@@ -1095,10 +1133,17 @@ class App(tk.Tk):
             )
             return
 
+        # 同一时间只跑一个接力：两个接力同时盯同一个下载夹，
+        # 谁先扫到就算谁的 —— 会把 A 下回来的文件记到 B 头上。
+        if self._relay_cancel is not None:
+            self._relay_cancel.set()
+
         # 快照 + 开始监视（与旧脚本同思路：忽略临时后缀、等大小稳定）
         import time as _t
         before = self._snapshot_dir(watch)
         started = _t.time()
+        cancel = threading.Event()
+        self._relay_cancel = cancel
         open_in_browser(url)
 
         prov = best.get("provider")
@@ -1115,8 +1160,14 @@ class App(tk.Tk):
 
         def run() -> None:
             got = self._watch_for_archive(
-                before, watch, timeout_sec=15 * 60, started_at=started
+                before, watch, timeout_sec=15 * 60, started_at=started,
+                cancel=cancel,
             )
+            if cancel.is_set():
+                # 被后开的接力顶掉了 —— 静默退出，别弹"没等到文件"吓人
+                return
+            if self._relay_cancel is cancel:
+                self._relay_cancel = None
             if not got:
                 self.msgq.put(("log", "接力：没等到新文件（可能还没下完或下到了别处）"))
                 self.msgq.put(("handoff", (False, "", 0)))
@@ -1136,8 +1187,8 @@ class App(tk.Tk):
                     self.msgq.put(("log", f"搬移失败 {name}：{e}"))
             self.msgq.put(("handoff", (True, dest, moved)))
 
-        self.worker = threading.Thread(target=run, daemon=True)
-        self.worker.start()
+        self._relay_thread = threading.Thread(target=run, daemon=True)
+        self._relay_thread.start()
 
     @staticmethod
     def _handoff_url(best: dict) -> str:
@@ -1167,11 +1218,15 @@ class App(tk.Tk):
     @staticmethod
     def _watch_for_archive(before: dict, folder: str, timeout_sec: int = 900,
                            started_at: float | None = None,
-                           settle: int = 2) -> list[str]:
+                           settle: int = 2,
+                           cancel: threading.Event | None = None) -> list[str]:
         """等新的压缩包出现并大小稳定。
 
         与旧脚本一致的要点：忽略 .crdownload 等下载中后缀；
         要求连续两次检查大小不变才算下完；比监视开始更早的文件当老文件。
+
+        ``cancel`` 被 set 时立刻返回空 —— 用于"用户又双击了另一行"的情形：
+        旧的接力必须让位，否则两个接力会争抢同一个下载夹里的文件。
         """
         import time as _t
 
@@ -1184,6 +1239,8 @@ class App(tk.Tk):
         inprog = (".crdownload", ".part", ".tmp", ".download", ".partial", ".opdownload")
 
         while _t.monotonic() < deadline:
+            if cancel is not None and cancel.is_set():
+                return []
             try:
                 names = os.listdir(folder)
             except OSError:
@@ -1228,13 +1285,10 @@ class App(tk.Tk):
             return
         best = (w["row"].get("best") or {})
         if not best.get("download_url"):
-            messagebox.showinfo(
-                "这个不能直接下载",
-                "N网 和 ayakamods 都必须先登录，而且**必须由你点一下下载按钮**"
-                "（站点就是这么设计的，工具绕不过去）。\n\n"
-                "用「用浏览器取文件」吧：我会打开正确的页面并盯着下载文件夹，"
-                "你点完下载，文件会自动被收进工具的下载夹。",
-            )
+            # 走到这里通常是从「下载全部」进来的（N网 / ayakamods 没有直链）。
+            # 不弹窗说教，直接转成接力：开页面 + 盯下载夹，
+            # 这样用户不管从哪条路进来，结果都是"能拿到文件"。
+            self._ctx_browser()
             return
         dest = tool_downloads_dir()
         entry = w["entry"]
