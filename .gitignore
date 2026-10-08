@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# PyInstaller 产物
+build/
+dist/
+*.spec
+
+# 运行时数据（配置/缓存/下载，含个人 API key，绝不提交）
+config.json
+sources.json
+ayaka_index.json
+last_result.json
+downloads/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store

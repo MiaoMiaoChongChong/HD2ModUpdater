@@ -1,0 +1,210 @@
+# HD2 Mod 更新管理器
+
+给 **HD2 Arsenal** 补上它缺少的更新检测：**GitHub、Nexus、ayakamods** 三个来源统一检查，
+中文界面，一键下载能自动化的部分。
+
+Arsenal 只对「N 网下载的模组」查更新（详见下方原理），从 GitHub / ayakamods 手动导入的
+ZIP 它永远不认识。这个工具就是补这一块——**它只读 Arsenal 的库，加载和部署仍然交给 Arsenal**。
+
+---
+
+## 快速开始
+
+1. 双击 **`启动.bat`**
+2. 程序会自动找到 Arsenal 的模组库（找不到才让你手动选）
+3. 点 **「检查更新」**
+4. 有更新的会标出来；能自动下载的点 **「下载全部可自动下载的」**
+
+### 填 Nexus API key（想要 N 网自动检查的话）
+
+N 网要求带 key 才能查，**免费申请、个人自用是允许的**：
+
+1. 打开 [nexusmods.com](https://www.nexusmods.com) → 登录 → 账号设置 → **API Keys**
+2. 复制底部的 **Personal API Key**
+3. 在工具里点 **「设置…」**，粘进去，保存
+
+不填也能用——只是 12 个 N 网模组会提示"需要设置 API key"，其余照常工作。
+
+---
+
+## 它能做什么
+
+| 功能 | 说明 |
+|---|---|
+| **自动找到 Arsenal** | 探测 `%LOCALAPPDATA%\hd2arsenal\hd2a_data.json`，也会扫其他盘；找不到才让你选 |
+| **三个站点统一检查** | GitHub / Nexus / ayakamods |
+| **智能识别来源** | 替你判断每个 mod 在网上对应哪个页面，**实测算出 18/20** |
+| **网站优先级** | 多平台发布时按 **GitHub > N网 > ayakamods** 取（按你的要求） |
+| **自动下载** | GitHub 的直链下载 + **sha256 校验** |
+| **浏览器接力** | N网 / ayakamods 需要登录，工具开好页面你点一下即可 |
+| **手动指定来源** | 实在认不出来的，右键就能填 |
+
+实测抓到过的真实更新（都是直链可下）：
+
+```
+Vanilla Plus Megapack Rows    本地 35      →  线上 v40
+HD2Runtime                    本地 0.28.1  →  线上 v0.30.0
+```
+
+---
+
+## 界面说明
+
+```
+┌─ Arsenal 模组库位置 ────────────────────────────────┐
+│  C:\Users\...\hd2arsenal\hd2a_data.json  [重新探测] [手动选择…]
+├─ 操作栏 ────────────────────────────────────────────┤
+│  [检查更新] [下载全部可自动下载的] [重建站点索引] [设置…]  ☑ 智能搜索来源
+├─ 结果表 ────────────────────────────────────────────┤
+│  状态 │ 模组 │ 本地 │ 线上 │ 来源 │ 说明
+│  有更新 │ Vanilla Plus Megapack Rows │ 35 │ v40 │ GitHub │ GitHub 搜索命中
+│  已最新 │ P-11 Self Heal             │ v8 │ v8  │ ayakamods │ 版本号已核对一致
+│  未找到来源 │ Resupply Boxes Emissive │ ? │ │ │ 右键指定来源
+└─────────────────────────────────────────────────────┘
+```
+
+**双击一行** = 打开发布页　**右键** = 复制链接 / 浏览器下载 / 指定来源 / 打开下载目录
+
+---
+
+## 智能识别是怎么工作的
+
+按可信度从高到低：
+
+1. **mod 自带 manifest 里作者写的来源** —— 最可信，直接采纳
+2. **Arsenal 库里的 N 网编号** —— N 网下载的必然准确
+3. **安装目录名里解析出的 N 网编号** —— 如 `Name 15298 0.2.2 2026-10-07T...`
+4. **GitHub 搜索** —— 按名字搜，但要求能看出跟 HD2 有关
+5. **ayakamods 本地索引** —— 爬下全站约 505 个 mod 建索引，模糊匹配
+
+**最关键的消歧手段是版本号核对**：本地版本和线上版本能对上的候选，几乎必然是正确的。
+例如 `Auto Reload` 会同时命中 `HD2 Auto Reload` 和 `Auto Reload Assist`，
+但只有前者的版本号（0.6.4）跟本地一致，于是正确选中。
+
+### 认不出来时怎么办
+
+右键 → **指定来源…**，填：
+
+| 站点 | 填什么 | 例子 |
+|---|---|---|
+| GitHub | 作者/仓库 | `SkyeShade/HD2Runtime` |
+| Nexus | 数字 ID | `15298` |
+| ayakamods | 页面地址或 slug | `https://ayakamods.com/mods/hd2runtime.4260/` |
+
+填一次就记住了。
+
+---
+
+## 下载说明
+
+| 来源 | 自动化程度 |
+|---|---|
+| **GitHub** | ✅ 全自动，带 sha256 校验 |
+| **Nexus** | 🟡 浏览器里点一下（要登录） |
+| **ayakamods** | 🟡 同上 |
+
+**为什么另两个不能全自动**：它们都要求登录才给文件。实测未登录时 ayakamods 的下载按钮
+只是个禁用的 `<span>`，站点根本不把下载链接发给匿名访客——这不是"要不要 cookie"的问题，
+是服务器端就不给。
+
+本工具**不碰你的 cookie**、不保存任何站点密码。用的是"浏览器接力"：你的登录态本来就在浏览器里，
+工具只负责开页面。
+
+下载好的 ZIP 在 **设置… → 下载保存位置**（默认 `%LOCALAPPDATA%\hd2-updater\downloads\`）。
+装法是：Arsenal 里 `Add mods / Import` 导入 → 旧的那份禁用后删除。
+
+---
+
+## 为什么 Arsenal 自己做不到
+
+解包看过它的代码，机制是：只对 `hd2a_data.json` 里 `nexusData` 非空的模组调
+`api.nexusmods.com/.../files.json?category=update`。手动导入的 ZIP 没有这个字段，
+所以永远不会提示更新。
+
+它也没有第三方插件接口（应用里那个 "extension" 是**浏览器扩展**，只服务 N 网下载按钮）。
+所以正确做法就是从外部补——也就是这个工具。
+
+---
+
+## 安全与隐私
+
+- **只读** Arsenal 的数据，绝不修改、不删除
+- **不碰** 浏览器 cookie、不存任何站点密码
+- API key 存在本机 `%LOCALAPPDATA%\hd2-updater\config.json`，只用于发查询请求
+- 下载 GitHub 文件时**校验 sha256**（与官方发布的一致才保留）
+- 对 ayakamods 做了请求节流（同站点间隔 3 秒），不给站点添麻烦
+
+---
+
+## 命令行模式
+
+```powershell
+python run.py --check          # 不开窗口检查一遍
+python run.py --check --all    # 连已最新的也列出来
+```
+
+退出码：`0` = 没有更新，`1` = 有更新，`2` = 出错。
+
+---
+
+## 文件位置
+
+| 内容 | 位置 |
+|---|---|
+| 配置（Arsenal 路径、API key） | `%LOCALAPPDATA%\hd2-updater\config.json` |
+| 已确认的来源 | `%LOCALAPPDATA%\hd2-updater\sources.json` |
+| ayakamods 索引 | `%LOCALAPPDATA%\hd2-updater\ayaka_index.json` |
+| 下载的 ZIP | `%LOCALAPPDATA%\hd2-updater\downloads\` |
+
+想重新识别所有来源：**设置… → 清空来源缓存**。
+
+---
+
+## 已知限制
+
+1. **ayakamods 靠爬网页**（站点没开放 API，搜索页还对脚本返回 403），靠列表页建索引。
+   站点改版就可能失效，出错信息会直接显示出来。
+2. **N 网必须填 key** 才能自动检查，这是 Nexus 的限制。
+3. **GitHub 未登录限额 60 次/小时**；可在设置里填 token 提到 5000。
+   超出会自动退回 `releases.atom`（只有版本号，没有下载直链）。
+4. **日期 vs 版本号**：ayakamods 上有些模组的"版本"栏填的是日期
+   （如 `2026-09-24`）。这种情况版本无法比较，会显示"版本存疑"而**不会**误报有更新。
+5. **少数 mod 认不出来**（本机 20 个里有 2 个），右键手动指定即可。
+
+---
+
+## 环境要求
+
+- Windows
+- Python 3.9+（tkinter 随 Python 自带）
+
+> 想要免装 Python 的 EXE？见 `build_exe.py`。
+
+---
+
+## 开发
+
+```
+hd2_updater/
+  util.py       HTTP（重试/节流）、版本比较、错误翻译
+  arsenal.py    定位并读取 Arsenal 库、猜版本、读 manifest 来源
+  providers.py  github_check / nexus_check / ayaka_check / ayaka_crawl
+  matcher.py    搜索词生成、相似度、来源识别、版本核对消歧
+  engine.py     Engine：解析来源 → 检查 → 汇总；下载
+  gui.py        中文 tkinter 界面
+  cli.py        命令行模式
+run.py          入口
+```
+
+改动后自测：
+
+```powershell
+python run.py --check
+```
+
+---
+
+**免责声明**：与 Arrowhead Game Studios、Sony、Nexus Mods、ayakamods 均无关联。
+本工具只做更新检查与下载，不修改游戏文件——部署仍由 HD2 Arsenal 完成。
+
+*版本 1.0.0*

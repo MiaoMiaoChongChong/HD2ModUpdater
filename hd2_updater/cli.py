@@ -1,0 +1,97 @@
+# -*- coding: utf-8 -*-
+"""命令行模式：不开窗口也能检查更新（排查问题、或接任务计划用）。
+
+用法：
+    python run.py --check
+    python run.py --check --all       # 连已最新的也列出来
+"""
+from __future__ import annotations
+
+import sys
+
+from .arsenal import find_data_file, load_library, read_config
+from .engine import (
+    ST_BETA,
+    ST_ERROR,
+    ST_NO_SOURCE,
+    ST_OK,
+    ST_UPDATE,
+    Engine,
+    source_key,
+)
+from .util import friendly_error
+
+W = 78
+STATUS_TXT = {
+    ST_UPDATE: "有更新",
+    ST_BETA: "仅测试版",
+    ST_OK: "已最新",
+    ST_ERROR: "查询失败",
+    ST_NO_SOURCE: "未找到来源",
+}
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = argv or []
+    show_all = "--all" in argv
+
+    path, how = find_data_file()
+    if not path:
+        print("没找到 HD2 Arsenal 的模组库（hd2a_data.json）。", file=sys.stderr)
+        print("请先运行一次 HD2 Arsenal，或用图形界面手动选择位置。", file=sys.stderr)
+        return 2
+
+    cfg = read_config()
+    print("=" * W)
+    print("  HD2 Mod 更新检查")
+    print(f"  模组库：{path}（{how}）")
+    print("=" * W)
+
+    eng = Engine(
+        path,
+        api_key=cfg.get("nexus_api_key", ""),
+        github_token=cfg.get("github_token", ""),
+        use_search=True,
+        log=lambda m: print(f"  · {m}"),
+        progress=lambda d, t, m: None,
+    )
+    eng.load()
+    eng.resolve_sources()
+    results = eng.check()
+    eng.persist_resolved()
+
+    order = {ST_UPDATE: 0, ST_BETA: 1, ST_ERROR: 2, ST_NO_SOURCE: 3, ST_OK: 4}
+    results = sorted(results, key=lambda r: order.get(r["status"], 9))
+
+    print()
+    n_upd = 0
+    for r in results:
+        st = r["status"]
+        if st == ST_OK and not show_all:
+            continue
+        e = r["entry"]
+        best = r.get("best") or {}
+        tag = STATUS_TXT.get(st, "?")
+        line = f"[{tag}] {e.get('label') or e.get('dirname')}"
+        print(f"\n{line}")
+        print(f"    本地 {r.get('installed') or '?'}"
+              + (f"  →  线上 {best.get('version')}" if best.get("version") else ""))
+        prov = best.get("provider")
+        if prov:
+            print(f"    来源 {prov}"
+                  + (f"　{best.get('url')}" if best.get("url") else ""))
+        if best.get("download_url"):
+            print(f"    直链 {best['download_url']}")
+            print(f"          （{best.get('asset_name')}）")
+        if best.get("how"):
+            print(f"    依据 {best['how'][:100]}")
+        if st == ST_ERROR and best.get("error"):
+            print(f"    错误 {friendly_error(best['error'])}")
+        if st == ST_UPDATE:
+            n_upd += 1
+
+    print()
+    print("=" * W)
+    print(f"  有更新：{n_upd} 个")
+    print("=" * W)
+    return 1 if n_upd else 0
