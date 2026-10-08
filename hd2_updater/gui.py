@@ -95,13 +95,13 @@ HOVER_TIPS = {
               "下好的条目会在列表里变成「已下载」，不会重复下第二次。\n\n"
               "N网 / ayakamods 这一栏下不了 —— 它们要求你先登录、\n"
               "而且必须由你亲自点一下下载按钮（站点设计如此）。\n"
-              "那些**双击对应那一行**即可：会打开下载页，下完自动收回来。",
+              "那些双击对应那一行即可：会打开下载页，下完自动收回来。",
     "btn_index": "重建站点索引 = 把 ayakamods 上全部 HD2 模组的清单爬下来，\n"
                  "存成本地索引（约 500 个，需 1~2 分钟）。\n\n"
                  "为什么需要：ayakamods 不提供搜索接口（对脚本返回 403），\n"
                  "所以只能先把整站列表抓下来，之后在本地做名字匹配，\n"
                  "用来自动识别你的模组对应站上哪个页面。\n\n"
-                 "**平时完全不用点**：\n"
+                 "平时完全不用点：\n"
                  "· 首次使用会自动建立\n"
                  "· 超过 7 天会自动重建（程序启动时在后台悄悄做）\n"
                  "· 点了「识别来源」时也会按需更新\n\n"
@@ -230,6 +230,7 @@ class App(tk.Tk):
         self._build_ui()
         # 检查数据目录是否发生回退（自定义位置不可用时，app_data_dir 会兜底）
         self.after(80, self._warn_if_data_dir_fallback)
+        self.after(100, self._warn_if_watch_mismatch)
         self.after(120, self._auto_detect)
         self.after(150, self._pump)
 
@@ -242,12 +243,38 @@ class App(tk.Tk):
                 "数据目录不可用",
                 f"{reason}\n\n"
                 f"可能原因：那块盘没插好/已拔掉、盘符变了、或路径被改过。\n\n"
-                f"程序已临时改用默认位置，**不会丢数据**；\n"
+                f"程序已临时改用默认位置，不会丢数据；\n"
                 f"要修好的话：把盘接回来，或到「设置…→数据位置」重新指定。",
             )
         # 启动后延迟一点在**后台**刷新站点索引（若已过期），
         # 这样用户真正点「识别来源」时就不必再等那一两分钟。
         self.after(1500, self._prewarm_index)
+
+    def _warn_if_watch_mismatch(self) -> None:
+        """接力相关的两个位置落在同一块盘上吗？跨盘现在能搬，但值得提一句。
+
+        背景：这个检查最初是因为一个真 bug —— 浏览器下载夹在 C 盘、
+        工具下载夹被改到 E 盘时，搬文件用的 os.replace 会抛
+        ``WinError 17 系统无法将文件移到不同的磁盘驱动器``，而调用方没看结果，
+        于是弹出"已收到文件（0 个）"，用户看着文件还在下载夹里一头雾水。
+
+        现在搬移已经换成能跨盘的 shutil.move，跨盘不再是问题；
+        这里只是**顺手提示**一下更省事的配置，不是报错，也不阻止使用。
+        """
+        try:
+            watch = arsenal.browser_watch_dir()
+            tool = arsenal.tool_downloads_dir()
+        except Exception:  # noqa: BLE001
+            return
+        dw = os.path.splitdrive(os.path.abspath(watch))[0].upper()
+        dt = os.path.splitdrive(os.path.abspath(tool))[0].upper()
+        if not dw or not dt or dw == dt:
+            return
+        # 只在用户**自定义**过位置时才提（默认情况下的跨盘也是正常用法）
+        if not (arsenal.is_custom_tool_downloads() or arsenal.is_custom_browser_watch()):
+            return
+        self.var_status.set(f"提示：下载夹在 {dw} 盘、工具下载夹在 {dt} 盘（跨盘搬移已支持，不影响使用）")
+        self.msgq.put(("log", "接力位置跨盘：会用复制方式搬文件，大文件会多花一点时间。"))
 
     def _prewarm_index(self) -> None:
         """后台预热 ayakamods 索引：只在过期且当前没在忙时做。"""
@@ -720,7 +747,7 @@ class App(tk.Tk):
         """引导用户去填令牌（首次使用/一直没填时用）。"""
         ans = messagebox.askyesno(
             "填访问令牌（可选）",
-            "两个令牌都是**可选**的，不填也能用，但填了会明显更顺：\n\n"
+            "两个令牌都是可选的，不填也能用，但填了会明显更顺：\n\n"
             "① Nexus API key —— 填了才能自动检查 N 网模组的更新\n"
             "    （你有 12 个 N 网模组；不填它们只能手动看）\n\n"
             "② GitHub token —— 把查询限额从 60 次/小时提到 5000\n"
@@ -934,8 +961,46 @@ class App(tk.Tk):
                     self.var_status.set("索引重建失败")
                     messagebox.showerror("索引重建失败", str(payload))
                 elif kind == "handoff":
-                    ok, dest, moved = payload
-                    if ok:
+                    ok, dest, moved, failed = payload
+                    if not ok and not failed:
+                        # 压根没扫到新文件
+                        self.var_status.set("接力：没等到新文件")
+                        messagebox.showinfo(
+                            "没等到文件",
+                            "15 分钟内没在监视的文件夹里发现新的压缩包。\n\n"
+                            "可能原因：\n"
+                            "· 还没点下载，或没下完（N网免费账号有等待时间）\n"
+                            "· 浏览器的下载位置和监视的不一样\n"
+                            "  （到「设置…→下载位置」里改成实际位置）\n\n"
+                            "也可以手动把下好的文件拖进工具的下载夹。",
+                        )
+                    elif failed:
+                        # 扫到了但没搬成 —— 必须如实说，不能报"已收到"。
+                        # 实测踩过：跨盘搬移失败时仍弹"已收到文件（0 个）"，
+                        # 用户看着文件还在下载夹里，完全对不上。
+                        self.var_status.set(f"接力：{len(failed)} 个文件没搬成功")
+                        detail = "\n".join(f"· {n}\n  {e}" for n, e in failed[:5])
+                        more = f"\n…另有 {len(failed) - 5} 个" if len(failed) > 5 else ""
+                        if moved:
+                            messagebox.showwarning(
+                                "部分文件没搬成",
+                                f"成功搬走 {moved} 个，但有 {len(failed)} 个没搬动：\n\n"
+                                f"{detail}{more}\n\n"
+                                f"列表里已搬走的那几条会标成「已下载」。\n"
+                                f"没搬动的还留在原文件夹里，你可以手动移过来。",
+                            )
+                        else:
+                            messagebox.showerror(
+                                "文件没能搬过来",
+                                f"在下载文件夹里找到了 {len(failed)} 个文件，"
+                                f"但搬到工具下载夹时失败了：\n\n"
+                                f"{detail}{more}\n\n"
+                                f"文件还在原来的下载文件夹里，没有丢，"
+                                f"但工具这次没收到它。\n\n"
+                                f"可以到「设置…→下载位置」把两个位置改到同一块盘上，"
+                                f"或者手动把文件移过来。",
+                            )
+                    else:
                         self.var_status.set(f"接力收到 {moved} 个文件 → {dest}")
                         # 重画，让这一条变成「已下载」
                         if self.results:
@@ -946,17 +1011,6 @@ class App(tk.Tk):
                             f"列表里这一条已标成「已下载」。\n\n"
                             f"接下来：在 Arsenal 里用 Add mods / Import 导入，"
                             f"然后把旧的那份禁用并删除。",
-                        )
-                    else:
-                        self.var_status.set("接力：没等到新文件")
-                        messagebox.showinfo(
-                            "没等到文件",
-                            "15 分钟内没在监视的文件夹里发现新的压缩包。\n\n"
-                            "可能原因：\n"
-                            "· 还没点下载，或没下完（N网免费账号有等待时间）\n"
-                            "· 浏览器的下载位置和监视的不一样\n"
-                            "  （到「设置…→下载位置」里改成实际位置）\n\n"
-                            "也可以手动把下好的文件拖进工具的下载夹。",
                         )
                 elif kind == "moved":
                     ok, msg = payload
@@ -974,7 +1028,7 @@ class App(tk.Tk):
                         self.var_status.set(f"数据位置已改为 {util.current_data_dir()}，请重启程序")
                         messagebox.showinfo(
                             "搬移完成",
-                            f"{msg}\n\n**请关闭并重新打开程序**，之后就会用新位置。\n\n"
+                            f"{msg}\n\n请关闭并重新打开程序，之后就会用新位置。\n\n"
                             f"（指针文件仍在默认位置，只存一行路径，不影响使用）",
                         )
                         try:
@@ -1005,7 +1059,7 @@ class App(tk.Tk):
             messagebox.showinfo("没有可自动下载的",
                                 "有更新的模组里没有可直接下载的（只有 GitHub 能直连下载）。\n\n"
                                 "N网 / ayakamods 需要登录，而且必须你亲自点一下下载按钮。\n"
-                                "**双击列表里那几行**就会打开对应的下载页，"
+                                "双击列表里那几行就会打开对应的下载页，"
                                 "下完的文件会自动收进工具的下载夹。")
             return
         self.btn_dl.configure(state="disabled", text="下载中…")
@@ -1170,22 +1224,31 @@ class App(tk.Tk):
                 self._relay_cancel = None
             if not got:
                 self.msgq.put(("log", "接力：没等到新文件（可能还没下完或下到了别处）"))
-                self.msgq.put(("handoff", (False, "", 0)))
+                self.msgq.put(("handoff", (False, "", 0, [])))
                 return
+
             moved = 0
+            failed: list[tuple[str, str]] = []   # (文件名, 原因)
             for fp in got:
                 name = os.path.basename(fp)
                 try:
                     dst = os.path.join(dest, name)
                     if os.path.abspath(fp) != os.path.abspath(dst):
-                        os.replace(fp, dst)
+                        # 必须用能跨盘的搬移 —— 用户下载夹在 C 盘、
+                        # 工具下载夹常被改到 D/E 盘，os.replace 会直接抛
+                        # WinError 17（实测踩过，导致"收到 0 个文件"的假成功）
+                        util.move_file(fp, dst)
                     moved += 1
                     # 接力也算「已下载」，界面上要跟着变
                     records.mark(key, ver, dst, prov or "", label)
                     self.msgq.put(("log", f"接力收到：{name}"))
                 except Exception as e:  # noqa: BLE001
+                    failed.append((name, str(e)))
                     self.msgq.put(("log", f"搬移失败 {name}：{e}"))
-            self.msgq.put(("handoff", (True, dest, moved)))
+
+            # 只要有搬失败的，就不能报"成功" —— 文件还在下载夹里，
+            # 报成功会让用户以为工具收走了，实际没动
+            self.msgq.put(("handoff", (moved > 0, dest, moved, failed)))
 
         self._relay_thread = threading.Thread(target=run, daemon=True)
         self._relay_thread.start()
@@ -1620,7 +1683,7 @@ class SourceDialog(tk.Toplevel):
         else:
             self.lbl_detect.configure(
                 text="✗ 认不出这是哪个站点的链接。请确认是 "
-                     "github.com / nexusmods.com / ayakamods.com 的**模组页面**地址。",
+                     "github.com / nexusmods.com / ayakamods.com 的模组页面地址。",
                 foreground=RED)
             self.btn_verify.configure(state="disabled")
 
@@ -1633,7 +1696,7 @@ class SourceDialog(tk.Toplevel):
         if not got:
             messagebox.showwarning(
                 "认不出这个链接",
-                "请贴这三个站点的**模组页面**地址（不是下载直链）：\n\n"
+                "请贴这三个站点的模组页面地址（不是下载直链）：\n\n"
                 "· github.com/作者/仓库\n"
                 "· nexusmods.com/helldivers2/mods/数字\n"
                 "· ayakamods.com/mods/xxx.数字/\n\n"
@@ -1989,7 +2052,7 @@ class SettingsDialog(tk.Toplevel):
         if not messagebox.askyesno(
             "选择监视的文件夹",
             "接下来会打开文件夹选择框。\n\n"
-            "请选中**你的浏览器实际下载到的那个文件夹** —— "
+            "请选中你的浏览器实际下载到的那个文件夹 —— "
             "可以到浏览器里 edge://settings/downloads 看「位置」。" + tip,
             parent=self,
         ):
@@ -2053,7 +2116,7 @@ class SettingsDialog(tk.Toplevel):
         if conflicts:
             allow_overwrite = messagebox.askyesno(
                 "目标目录已有同名文件",
-                "这些文件在目标目录里**已经存在**，继续会覆盖它们：\n\n  "
+                "这些文件在目标目录里已经存在，继续会覆盖它们：\n\n  "
                 + "\n  ".join(conflicts)
                 + "\n\n如果那是你以前的备份或别的数据，请点「否」换个空目录。\n\n"
                   "确定要覆盖吗？",
@@ -2148,7 +2211,7 @@ class SettingsDialog(tk.Toplevel):
         msg = ("清空来源缓存？\n\n"
                f"将清除 {auto} 条自动识别的来源，下次检查会重新智能搜索。\n")
         if manual:
-            msg += (f"\n有 {manual} 条是**你手工指定**的，会被保留，不会删除。\n")
+            msg += (f"\n有 {manual} 条是你手工指定的，会被保留，不会删除。\n")
         if not messagebox.askyesno("确认", msg, parent=self):
             return
         n = clear_auto_sources()

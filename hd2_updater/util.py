@@ -405,6 +405,32 @@ def app_data_dir() -> str:
     return tmp
 
 
+def move_file(src: str, dst: str, overwrite: bool = True) -> str:
+    """把文件从 src 搬到 dst —— **能跨盘**，返回落地路径。
+
+    为什么不能用 os.replace：Windows 上 os.replace 跨磁盘会直接抛
+    ``OSError [WinError 17] 系统无法将文件移到不同的磁盘驱动器``。
+    而"用户的下载夹"（C:\\Users\\x\\Downloads）和"工具下载夹"经常不在一块盘上
+    （用户把数据目录改到了 E/D 盘就会这样），于是"收文件"这一步**必然失败**。
+
+    实测踩过：接力扫到了文件、却搬不动，而调用方没检查结果，
+    于是弹出"已收到文件（0 个）"——用户看着文件还在下载夹里，完全摸不着头脑。
+
+    shutil.move 在同盘时是重命名（快），跨盘时自动退化成"复制 + 删源"。
+    """
+    import shutil
+
+    parent = os.path.dirname(dst)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    if os.path.exists(dst):
+        if not overwrite:
+            raise FileExistsError(f"目标已存在：{dst}")
+        os.remove(dst)
+    shutil.move(src, dst)
+    return dst
+
+
 # 会被搬移的文件/目录（相对数据目录）
 MOVE_ITEMS = ("config.json", "sources.json", "ayaka_index.json", "downloads",
               "downloads.json")

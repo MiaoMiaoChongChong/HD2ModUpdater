@@ -313,15 +313,19 @@ def nexus_check(mod_id: str, api_key: str) -> dict:
     # 记录精确的 file id，方便拼直达链接
     out["file_id"] = str(top.get("file_id") or "")
     # 深链：打开就直接落在 Files 页签的这一个文件上，不用自己去列表里找。
-    # 格式依据（Nexus 官方/自家项目里都在用）：
+    # 格式依据：Nexus 官方/自家项目里都在用
     #   https://www.nexusmods.com/{game}/mods/{mod_id}?tab=files&file_id={file_id}
-    # 末尾的 &nmm=1 是 Nexus 自己给「Mod Manager 下载」按钮用的参数
-    # （Vortex 生成的链接就带它），带上它页面会给出一键交给管理器下载的按钮，
-    # 正好能接上已注册了 nxm:// 协议的 Arsenal。
+    #
+    # 【不要再加 &nmm=1】—— 实测踩过：带上它页面会给「交给管理器下载」的入口，
+    # 本机 nxm:// 又指向 HD2 Arsenal，于是用户双击后**直接被 Arsenal 接管**，
+    # 而 Arsenal 当时并未登录 N 网，日志里是
+    #   Error parsing NXM URL: ... AxiosError: Request failed with status code 401
+    # 用户被迫手动改回浏览器下载。
+    # 本工具的定位是「开好页面 + 收文件」，不该把下载甩给别的程序。
     if out["file_id"]:
         out["file_url"] = (
             f"https://www.nexusmods.com/helldivers2/mods/{mod_id}"
-            f"?tab=files&file_id={out['file_id']}&nmm=1"
+            f"?tab=files&file_id={out['file_id']}"
         )
     return out
 
