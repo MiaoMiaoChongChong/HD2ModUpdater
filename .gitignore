@@ -27,3 +27,7 @@ downloads/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# 测试用的临时数据目录（跑测试时自动建立，里面会有假 config/sources）
+tests/_tmp_*/
+tests/_tmp_dbg/

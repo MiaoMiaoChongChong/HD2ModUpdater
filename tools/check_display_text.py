@@ -24,6 +24,12 @@ DISPLAY_FUNCS = {
 # 这些名字里放的字符串也是给用户看的（悬停提示表等）
 DISPLAY_VARS = {"HOVER_TIPS", "TIP", "TIPS", "HELP"}
 
+# 这些 dict 字段会被界面**原样**填进表格/提示（不是显示函数的实参，
+# 所以需要单独盯）。来源：gui.py 的 _populate / _update_note 读了它们。
+VISIBLE_FIELDS = {
+    "pick_reason", "error", "note", "how", "title", "message", "text", "status",
+}
+
 
 def collect_docstring_ids(tree: ast.Module) -> set[int]:
     ids: set[int] = set()
@@ -85,6 +91,49 @@ def check(path: Path) -> list[str]:
             return ""
         return ""
 
+    def in_visible_field(node: ast.AST) -> str:
+        """这个常量是不是被放进了「界面上会原样显示」的字段里。
+
+        为什么需要这第二类检查：GUI 的「说明」列是拿 ``best["pick_reason"]``、
+        ``best["error"]`` 直接填的（providers/engine 里返回）。这些字符串
+        **不是**显示类调用的实参，第一版检查完全看不到它们 ——
+        实测就是这样漏掉了两处（表格里会显示成「现在**没有**」）。
+
+        关键点（第一次写错在这里）：字段名在**赋值的目标**上，
+        比如 ``out["pick_reason"] = "..."`` —— 那个 Subscript 是 Assign 的
+        target，**不是**字符串常量的祖先节点。所以要走到 Assign 时
+        回头看它的 targets，而不是指望能往上遇到 Subscript。
+        """
+        cur: ast.AST = node
+        for _ in range(8):
+            p = parent.get(id(cur))
+            if p is None:
+                return ""
+            if isinstance(p, ast.Assign):
+                for t in p.targets:
+                    if (isinstance(t, ast.Subscript)
+                            and isinstance(t.slice, ast.Constant)
+                            and isinstance(t.slice.value, str)
+                            and t.slice.value in VISIBLE_FIELDS):
+                        return t.slice.value
+                cur = p
+                continue
+            if isinstance(p, ast.AnnAssign):
+                t = p.target
+                if (isinstance(t, ast.Subscript)
+                        and isinstance(t.slice, ast.Constant)
+                        and isinstance(t.slice.value, str)
+                        and t.slice.value in VISIBLE_FIELDS):
+                    return t.slice.value
+                return ""
+            if isinstance(p, (ast.keyword, ast.Tuple, ast.List, ast.Dict,
+                              ast.JoinedStr, ast.BinOp, ast.IfExp, ast.Return,
+                              ast.Call)):
+                cur = p
+                continue
+            return ""
+        return ""
+
     problems: list[str] = []
     # ① 悬停提示之类的字典
     for node in ast.walk(tree):
@@ -100,13 +149,17 @@ def check(path: Path) -> list[str]:
                             f"（tkinter 不渲染，会显示成星号）"
                         )
 
-    # ② 显示类函数调用的实参
+    # ② 显示类函数调用的实参 + 界面直接显示的字段
     for node in ast.walk(tree):
         if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
             continue
         if "**" not in node.value or id(node) in doc_ids:
             continue
         sink = in_display_call(node)
+        if not sink:
+            field = in_visible_field(node)
+            if field:
+                sink = f"界面显示的字段 [{field}]"
         if sink:
             first = node.value.strip().splitlines()[0][:40]
             problems.append(

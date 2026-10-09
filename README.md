@@ -213,7 +213,17 @@ HD2Runtime                    本地 0.28.1  →  线上 v0.30.0（GitHub 直链
 | 打开已下载的文件 | 用系统默认程序打开那个 ZIP，或定位到它所在文件夹 |
 | 复制链接 | 复制下载直链（没有直链时给要打开的页面地址） |
 | 指定来源… | 认不出来时手填一次 |
+| **撤销来源并重新识别** | 指定错了 / 站点改名了，想回到自动识别时用（手工填的那条也会一并撤掉，然后立刻重新识别这一条） |
 | 打开下载目录 | 打开工具的下载夹 |
+
+> **指定错了怎么办**：手工指定的来源是受保护的 —— 自动识别不会覆盖它，
+> 「清空来源缓存」也只清自动的。所以如果填错了，用右键的
+> **「撤销来源并重新识别」** 就能把这一条彻底撤销、回到自动识别。
+>
+> 这个操作**不会让你丢掉手工填的地址**：撤销后如果重新识别什么也没找到
+> （比如你关掉了「智能搜索来源」，或当前离线、索引还没建好），
+> 原来的来源会被**自动放回去**，并明确告诉你"没找到新来源，已还原"。
+> 想强行换一个来源，用右键「指定来源…」直接填新的地址就行。
 
 **设置…** 里有 **「去获取 Nexus key」/「去获取 GitHub token」** 按钮，
 一键跳到官方页面拿密钥，不用自己找入口。
@@ -246,7 +256,7 @@ HD2Runtime                    本地 0.28.1  →  线上 v0.30.0（GitHub 直链
 2. **Arsenal 库里的 N 网编号** —— N 网下载的必然准确
 3. **安装目录名里解析出的 N 网编号** —— 如 `Name 15298 0.2.2 2026-10-07T...`
 4. **GitHub 搜索** —— 按名字搜，但要求能看出跟 HD2 有关
-5. **ayakamods 本地索引** —— 爬下全站约 505 个 mod 建索引，模糊匹配
+5. **ayakamods 本地索引** —— 爬下全站全部 mod 建索引（2026-10 实测约 870 个），模糊匹配
 
 **最关键的消歧手段是版本号核对**：本地版本和线上版本能对上的候选，几乎必然是正确的。
 例如 `Auto Reload` 会同时命中 `HD2 Auto Reload` 和 `Auto Reload Assist`，
@@ -261,6 +271,10 @@ HD2Runtime                    本地 0.28.1  →  线上 v0.30.0（GitHub 直链
 | GitHub | 作者/仓库 | `SkyeShade/HD2Runtime` |
 | Nexus | 数字 ID | `15298` |
 | ayakamods | 页面地址或 slug | `https://ayakamods.com/mods/hd2runtime.4260/` |
+
+**ayakamods 的中文 mod 也支持**：站点上约三分之一的 mod 是中文名，它们的
+地址里带中文（浏览器地址栏显示成 `…/mods/机甲部位血量HUD.4775/`）。
+这种地址**原样粘进来就行**，程序会自己编码；不需要你手动转成 `%E6%9C...`。
 
 填一次就记住了。
 
@@ -410,9 +424,14 @@ python run.py --check --all    # 连已最新的也列出来
    超出会自动退回 `releases.atom`（只有版本号，没有下载直链）。
 5. **日期 vs 版本号**：ayakamods 上有些模组的"版本"栏填的是日期
    （如 `2026-09-24`）。这种情况版本无法比较，会显示"版本存疑"而**不会**误报有更新。
-6. **少数 mod 认不出来**（实测 20 个里有 1~2 个），右键手动指定即可。
+   只有本地版本和线上版本能用 `same`/`older` 对上的候选，才会被标为"版本号已核对一致"；
+   仅仅是"线上有更新的版本"属于弱线索，不会被说成已核对。
+6. **少数 mod 认不出来**（实测 20 个里有 1~2 个），右键手动指定即可；
+   指定错了可以用右键「撤销来源并重新识别」退回来。
 7. **「已下载」只是引用，不搬运**：你把下载夹里的 ZIP 移走/删掉后，
    那一行会退回「有更新」并附一句提示 —— 这是故意的，避免误以为新版已就绪。
+8. **ayakamods 的中文地址**：中文 mod 的页面地址里含中文，粘进
+   「指定来源…」时**原样粘贴即可**（不用自己转码）。
 
 ---
 
@@ -436,7 +455,7 @@ python build_exe.py      # 产物在 dist\HD2ModUpdater.exe
 hd2_updater/
   util.py       HTTP（重试/节流）、版本比较、错误翻译、数据目录管理
   arsenal.py    定位并只读 Arsenal 库、猜版本、还原变体名、读 manifest 来源
-  providers.py  github_check / nexus_check / ayaka_check / ayaka_crawl
+  providers.py  github_check / nexus_check / ayaka_check / ayaka_crawl、网址识别
   matcher.py    搜索词生成、相似度、来源识别、版本核对消歧
   engine.py     Engine：解析来源 → 检查 → 汇总；下载
   records.py    下载记录（哪个模组下了哪一版、文件在哪）
@@ -445,16 +464,26 @@ hd2_updater/
 tools/
   check_names.py          静态检查「用了但没定义」的名字
   check_display_text.py   静态检查用户可见文案里残留的 markdown `**`
+tests/
+  run_all.py              一条命令跑全部检查 + 测试
+  test_fixes.py           离线测试：中文来源、撤销来源、相似度不误配、索引格式
+  test_gui_undo.py        界面测试：右键「撤销来源并重新识别」全流程
+  test_checker_negative.py 负向验证：检查脚本自己能不能抓到问题
+  test_live_ayaka.py      联网端到端（重建索引 + 真实爬页面 + 真实匹配）
+  fixtures/               真实页面 HTML（离线测试用，不联网）
 run.py          入口
 ```
 
 改动后自测：
 
 ```powershell
+python tests/run_all.py                  # 全部静态检查 + 离线/界面测试（秒级）
+python tests/test_live_ayaka.py          # 联网端到端（约 3~5 分钟，会真爬 44 页）
 python run.py --check                    # 命令行跑一遍
-python tools/check_names.py              # 静态检查
-python tools/check_display_text.py       # 文案检查
 ```
+
+> 测试都跑在临时的数据目录里（`HD2U_DATA_DIR`），**不会动你的真实配置和来源表**。
+
 
 欢迎提 issue / PR。改动请尽量保持「只读 Arsenal」这一条底线。
 
@@ -468,4 +497,4 @@ python tools/check_display_text.py       # 文案检查
 本工具只做更新检查与下载，不修改游戏文件——部署仍由 HD2 Arsenal 完成。
 请遵守各站点的服务条款；本工具不绕过登录、不抓取需要授权的下载。
 
-*版本 1.0.0*
+*版本 1.0.1*

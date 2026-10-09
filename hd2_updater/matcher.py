@@ -49,6 +49,37 @@ def keywords(name: str) -> list[str]:
     return words
 
 
+def _contains_as_words(short: str, long_: str) -> bool:
+    """short 是否以**独立单词**的形式出现在 long_ 里。
+
+    不能用裸 `in`：实测 "e"（某模组的描述就一个字）是 "mech part hud" 的子串，
+    于是被判成 90% 相似 —— 而描述只按 0.8 折算，仍有 0.72，直接越过 0.55 的
+    门槛，最后把一个中文 HUD 模组错配成 "VRC Tell CE-07 CM-21"。
+    用前后不能紧挨字母数字的方式判定，能挡掉这种"嵌在单词中间"的假包含。
+    """
+    if not short or not long_:
+        return False
+    return re.search(r"(?<![0-9a-z])" + re.escape(short) + r"(?![0-9a-z])",
+                     long_) is not None
+
+
+# 「包含」关系成立时给的高分。
+_BONUS_FOR_CONTAINS = 0.9
+# 参与"包含"判定的最短长度。
+#
+# 这个数字是**量出来的**，不是拍的。在站上真实的 871 条索引上跑
+# 「用条目自己的站上名字能不能找回自己」/「会不会自动采纳到别人（high）」：
+#   gate=2 -> 自召回 825 / 错配 18
+#   gate=3 -> 自召回 825 / 错配 18     <-- 与 2 完全相同，但更严格
+#   gate=4 -> 自召回 821 / 错配 16     <-- 少了 4 条真 mod
+# 即：门槛 4 会白丢 4 条真实模组（「解锁台（Unlock Kit）」、'DSS Supreme'、
+# 'Uzi Stalwart'、'(Blue Archive) HOD Harvester'）—— 名字短是它们的特征，
+# 不是噪声；而错配数几乎不随门槛变化（真正把关的是**词边界**和下面
+# 「长名套短名」那道防呆）。所以取 3：不丢真 mod，又比 2 更保守一点
+# （挡住两字符的退化输入）。
+_MIN_CONTAINS_LEN = 3
+
+
 def similarity(a: str, b: str) -> float:
     """两个名字的相似度 0~1。"""
     na, nb = normalize(a), normalize(b)
@@ -56,9 +87,11 @@ def similarity(a: str, b: str) -> float:
         return 0.0
     if na == nb:
         return 1.0
-    # 一个包含另一个，给高分
-    if na in nb or nb in na:
-        return 0.9
+    # 一个包含另一个，给高分。但必须是**词级**包含、且短的那个不至于退化 ——
+    # 否则一两个字符的描述/名字会把毫不相干的模组抬到高分（见上面注释）。
+    short, long_ = (na, nb) if len(na) <= len(nb) else (nb, na)
+    if len(short) >= _MIN_CONTAINS_LEN and _contains_as_words(short, long_):
+        return _BONUS_FOR_CONTAINS
     return SequenceMatcher(None, na, nb).ratio()
 
 
@@ -177,7 +210,7 @@ def search_terms(entry: dict) -> list[str]:
 # --------------------------------------------------------------------------
 # 站点索引的保鲜期（天）。超过就自动重建。
 # 为什么是 7 天：ayakamods 上每天都有新模组上架，索引太旧会导致新模组
-# 识别不到；而重建要爬 500+ 页（约 90 秒），也不宜太频繁。
+# 识别不到；而重建要翻 40+ 页（约 2 分钟），也不宜太频繁。
 INDEX_TTL_DAYS = 7
 
 # 防止并发抓取：后台自动刷新和用户点「识别来源」可能撞在一起
@@ -194,19 +227,42 @@ def index_path() -> str:
     return os.path.join(app_data_dir(), "ayaka_index.json")
 
 
+# 索引的**格式版本**。加这一层是因为：老索引是用写死 [a-z0-9-.] 的正则爬的，
+# 里面**一条中文 mod 都没有**（实测 500 条里零条）。如果只按时间判断新鲜度，
+# 用户的旧索引还会继续用满 7 天，中文化的那些模组就一直识别不出来 ——
+# 典型的「修了代码但用户那里没生效」。
+# 一旦解析逻辑变了（或站点结构变了导致内容缺失），把这里 +1 即可强制重建。
+INDEX_FORMAT = 2
+
+
 def load_index() -> list[dict]:
+    """读索引。老格式（裸 list）或任何损坏形态都读成空 —— 触发重建。"""
     try:
         with open(index_path(), encoding="utf-8-sig") as f:
-            return json.load(f) or []
+            data = json.load(f)
     except Exception:  # noqa: BLE001
         return []
+    if not isinstance(data, dict):
+        return []          # 老格式（裸 list）或其他怪东西：一律重建
+    try:
+        fmt = int(data.get("format") or 0)
+    except (TypeError, ValueError):
+        # format 被改坏了（"two" / [2] 之类）。不能让它抛出去 ——
+        # 这个函数在界面和引擎的热路径上被调用，抛异常会连累整条流程；
+        # 当作格式不对、触发重建才是正确处置。
+        return []
+    if fmt != INDEX_FORMAT:
+        return []
+    items = data.get("items")
+    return items if isinstance(items, list) else []
 
 
 def save_index(items: list[dict]) -> None:
     try:
         tmp = index_path() + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(items, f, ensure_ascii=False, indent=1)
+            json.dump({"format": INDEX_FORMAT, "items": items}, f,
+                      ensure_ascii=False, indent=1)
         os.replace(tmp, index_path())
     except Exception:  # noqa: BLE001
         pass
@@ -222,15 +278,25 @@ def index_age_days() -> float:
 
 
 def index_is_stale() -> bool:
-    """索引是否需要重建（不存在或过期）。"""
-    return index_age_days() < 0 or index_age_days() > INDEX_TTL_DAYS
+    """索引是否需要重建（不存在、格式不对、或过期）。"""
+    if not load_index():          # 不存在 / 老格式 / 格式版本对不上
+        return True
+    return index_age_days() > INDEX_TTL_DAYS
 
 
 def index_status_text() -> str:
-    """给界面用的一句话状态描述。"""
+    """给界面用的一句话状态描述。
+
+    注意必须**先看索引是不是真的能用**（load_index 会拒掉老格式）。
+    只看文件修改时间的话，老格式的索引文件明明刚写过、会显示
+    "刚刚更新过（每 7 天自动更新）"，而实际上一读就是空的、马上要重建 ——
+    设置里那行状态就成了假消息。
+    """
+    if not load_index():
+        if index_age_days() < 0:
+            return "尚未建立（首次使用会自动建立）"
+        return "格式已升级，下次使用时会自动重建"
     age = index_age_days()
-    if age < 0:
-        return "尚未建立（首次使用会自动建立）"
     if age < 1:
         return "刚刚更新过"
     days = int(age)
@@ -255,10 +321,24 @@ def rebuild_index(progress=None) -> list[dict]:
         _crawl_state["running"] = True
         if progress:
             progress("正在抓取 ayakamods 模组列表（约 1~2 分钟）…")
+        before = load_index()
         items = providers.ayaka_crawl()
         items = [i for i in items if i.get("slug")]
-        if items:
-            save_index(items)
+
+        # ★ 只有**明显完整**的结果才允许覆盖盘上的索引。
+        # 为什么：ayaka_crawl 一遇空页就 break，所以网络抖一下、或被 Cloudflare
+        # 拦在第 N 页，就会返回一个"只有前 N 页"的残缺列表。原来只看 `if items:`
+        # 就落盘 —— 于是一次抖动会把 800+ 条的好索引换成几十条，而且
+        # index_is_stale() 会认为它很新鲜、锁死 7 天，用户在这 7 天里
+        # 一直在用一个残缺索引去识别来源（表现为"很多 mod 突然认不出来了"）。
+        if not items:
+            return before
+        if before and len(items) < len(before) * 0.8:
+            if progress:
+                progress(f"本次只抓到 {len(items)} 条（原有 {len(before)} 条），"
+                         f"看起来没抓完 —— 保留原索引")
+            return before
+        save_index(items)
         return items
     finally:
         _crawl_state["running"] = False
@@ -288,16 +368,29 @@ def unescape(text: str) -> str:
     return _html.unescape(str(text or ""))
 
 
+def slug_text(slug: str) -> str:
+    """slug -> 能拿去跟本地名字比的可读文本。
+
+    必须**先做百分号解码**再去掉 "-"、编号：中文 mod 的 slug 在站点上是
+    `%E6%9C%BA%E7%94%B2...%E8%A1%80%E9%87%8FHUD.4775` 这种，
+    不解码就等于拿一串 %E6%9C 去跟「机甲部位血量HUD」比相似度，永远是 0 分，
+    这些 mod 一辈子识别不出来。
+    """
+    s = unescape(providers.ayaka_decode(slug))
+    s = s.replace("-", " ").rsplit(".", 1)[0]
+    return s.strip()
+
+
 def search_ayaka_index(query: str, items: list[dict], top: int = 5) -> list[dict]:
     """在本地索引里模糊搜。"""
     scored = []
     for it in items:
         title = unescape(it.get("title") or "")
-        slug_txt = unescape((it.get("slug") or "").replace("-", " ").rsplit(".", 1)[0])
+        stext = slug_text(it.get("slug") or "")
         desc = unescape(it.get("desc") or "")
         s = max(
             similarity(query, title),
-            similarity(query, slug_txt),
+            similarity(query, stext),
             similarity(query, desc) * 0.8,      # 描述只作弱证据
         )
         if s >= 0.55:
@@ -306,7 +399,7 @@ def search_ayaka_index(query: str, items: list[dict], top: int = 5) -> list[dict
     return [
         {
             "slug": it["slug"],
-            "title": unescape(it.get("title") or it["slug"]),
+            "title": unescape(it.get("title") or slug_text(it["slug"])),
             "score": round(s, 3),
             "author": it.get("author", ""),
             "desc": unescape(it.get("desc") or "")[:120],
@@ -328,6 +421,21 @@ def disambiguate_ayaka(
 
     注意：本地版本号为空时**不做核对**（没依据），只按名字相似度排。
     另外同名的旧页面（如 .4035 与 .4037）要优先选版本更高的那个。
+
+    ★ 只有 ``same``（版本号**完全相等**）才算 ``verified``。这一条是血泪教训：
+
+      · ``older`` 曾经也算强证据，理由是"同一个 mod 的站点页面可能落后于本地"。
+        但版本比较是**数字元组**比较，随便一个无关 mod 只要版本号比本地小
+        就会命中 ``older`` —— 实测本地「机甲部位血量HUD 1.11.1」会被判成
+        "版本号已核对一致"、相似度凭空涨到 99%，从而**自动采纳**
+        站点上毫不相干的「Wrench Repair 1.3」（真实名字相似度只有 0.64）。
+        认错会让人去更新一个完全无关的模组，是本工具最严重的失效模式。
+      · ``newer``（线上更新）对"这个模组有更新"是正常的，但对"这是不是同一个
+        mod"只是**弱线索** —— 任何无关 mod 只要有更高版本号都符合。给一点加分
+        参与排序，但同样不算核对过。
+
+    因此顺序上：``same`` 才算强证据；``older`` 不给任何加分（它太容易误命中）；
+    ``newer`` 给少量加分但不标 verified。
     """
     if len(hits) <= 1:
         return hits
@@ -345,23 +453,29 @@ def disambiguate_ayaka(
     scored: list[tuple] = []
     for h in hits:
         bonus = 0.0
+        strong = False
         try:
             info = check_version(h["slug"])
             if info and info.get("ok"):
                 v = compare(installed_version, info.get("version", ""))
-                if v in ("same", "older"):
-                    bonus = 0.35          # 版本对得上，强证据
+                if v == "same":
+                    bonus, strong = 0.35, True     # 版本号完全相等，强证据
                 elif v == "newer":
-                    bonus = 0.15          # 只是有新版，也算线索
+                    bonus = 0.15                   # 有新版：弱线索，不算核对
+                # older：不给加分。它太容易被无关 mod 撞上（见上面注释）。
         except Exception:  # noqa: BLE001
             pass
-        scored.append((h["score"] + bonus, h, bonus))
+        scored.append((h["score"] + bonus, h, bonus, strong))
     scored.sort(key=lambda x: -x[0])
     out = []
-    for total, h, bonus in scored:
+    for total, h, bonus, strong in scored:
         h = dict(h)
+        # 保留**纯名字分**：界面要显示的是"站上名字跟你的有多像"，
+        # 不能把版本加分算进去 —— 否则会说出「相似度 99%」这种假数字
+        # （真实只有 64%），用户就被这个百分比骗着信任了一个错配。
+        h["name_score"] = h["score"]
         h["score"] = round(min(1.0, total), 3)
-        if bonus:
+        if strong:
             h["verified"] = True
         out.append(h)
     return out
@@ -416,7 +530,7 @@ def candidates_for(
             elif prov == "github" and src.get("id"):
                 url = f"https://github.com/{src['id']}"
             elif prov == "ayaka" and src.get("id"):
-                url = f"https://ayakamods.com/mods/{src['id']}/"
+                url = providers.ayaka_url(src["id"])
         add(prov, src.get("id", ""), url, src["how"], "high")
         say(f"manifest 里找到 {prov} 来源")
 
@@ -526,20 +640,31 @@ def candidates_for(
                 extra = {w for w in (site_words - local_words)
                          if w not in STOPWORDS and len(w) > 2}
                 if len(extra) >= 2:
-                    say(f"索引命中 {top['slug']} 但站上名字多出 {sorted(extra)}，判为不同 mod")
+                    # 用解码后的名字（或站上标题）说明，不要把百分号编码的原始 slug
+                    # 甩给用户看 —— 中文 mod 的 slug 是 %E6%9C%BA%E7%94%B2… 这种，
+                    # 直接把编码串当"模组名"显示，用户会以为程序出错了
+                    # （这正是他反馈的那类问题）。
+                    shown = top.get("title") or providers.ayaka_decode(top["slug"])
+                    say(f"索引命中「{shown}」但站上名字多出 {sorted(extra)}，判为不同 mod")
                     continue
             conf = "high" if top.get("verified") or top["score"] >= 0.85 else "medium"
-            add(
-                "ayaka",
-                top["slug"],
-                f"https://ayakamods.com/mods/{top['slug']}/",
-                f"ayakamods 索引命中（站上叫「{top['title']}」，相似度 {top['score']:.0%}"
-                + ("，版本号已核对一致" if top.get("verified") else "") + "）",
-                conf,
-                title=top.get("title", ""),
-                alternatives=[h["slug"] for h in hits[1:3]],
-            )
-            say(f"ayakamods 搜到 {top['slug']}（{top['score']:.0%}）")
+            # 文案里报**纯名字分**（name_score）：加了版本加分的那个数会被说成
+            # 「相似度 99%」，而真实名字只有 64% —— 那种假百分比会让用户
+            # 放心地接受一个错配。版本加分单独用一句话说明。
+            name_pct = top.get("name_score", top["score"])
+            how = (f"ayakamods 索引命中（站上叫「{top['title']}」，"
+                   f"名字相似度 {name_pct:.0%}"
+                   + ("，版本号完全一致" if top.get("verified") else "") + "）")
+            add("ayaka", top["slug"], providers.ayaka_url(top["slug"]), how,
+                conf, title=top.get("title", ""),
+                # 备选也用**可读名字**：这个字段是给人看的（将来要在界面上
+                # 列"还可能是哪几个"）。存原始 slug 的话，中文 mod 就是
+                # 一串 %E6%9C，露出去又是同一类毛病。
+                alternatives=[h.get("title") or providers.ayaka_decode(h["slug"])
+                              for h in hits[1:3]])
+            say(f"ayakamods 搜到 {providers.ayaka_decode(top['slug'])}"
+                f"（名字相似度 {name_pct:.0%}"
+                + ("，版本号一致" if top.get("verified") else "") + "）")
             break
 
     # 按用户要求的优先级排序：GitHub > Nexus > ayakamods

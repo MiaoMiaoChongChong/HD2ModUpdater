@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import html as _html
 import re
 import urllib.parse
 
@@ -34,6 +35,15 @@ from .util import (
 )
 
 GITHUB_API = "https://api.github.com"
+
+
+def unescape_html(text: str) -> str:
+    """还原 HTML 实体（&#039; &amp; 等）。
+
+    站点上中文/符号的标题经常写成实体，不还原的话索引里存的是
+    「Helldivers&#039; Ammunition」这种，拿去跟本地名字比相似度必然偏低。
+    """
+    return _html.unescape(str(text or ""))
 
 
 def _empty(provider: str) -> dict:
@@ -220,7 +230,8 @@ def _asset_candidates(info: dict, asset_glob: str = "") -> list[dict]:
 
 
 def _variant_missing_note(variant: str) -> str:
-    return (f"你这个「{variant}」变体在这个新版里**没有**（作者可能已经停更该变体），"
+    """这段文字会显示在表格的「说明」列里 —— 不能带 markdown 星号。"""
+    return (f"你这个「{variant}」变体在这个新版里没有（作者可能已经停更该变体），"
             f"下面给的是同一发布里的其它包，装之前先确认是不是你要的。")
 
 
@@ -457,8 +468,10 @@ def _pick_nexus_file(files: list[dict], variant: str = "") -> tuple[dict, str]:
     if variant:
         # 没找到同变体 —— **绝不能**静静换成另一个（那就是本 bug 本身）。
         # 明确说明"这不是你要的那个变体"，由界面去提醒用户。
+        # （这段文字会**原样显示**在表格的「说明」列里，tkinter 不渲染
+        #   markdown，所以不能写星号 —— 会显示成「现在**没有**」。）
         return pool[0], (
-            f"这个 mod 现在**没有**「{variant}」变体了（作者可能已停更该变体）。"
+            f"这个 mod 现在没有「{variant}」变体了（作者可能已停更该变体）。"
             f"下面是同一 mod 的其它变体「{pool[0].get('name')}」"
             f"（v{pool[0].get('version')}），装之前请确认是不是你要的"
         )
@@ -563,24 +576,210 @@ def nexus_check_many(mod_ids: list[str], api_key: str) -> dict[str, dict]:
 # --------------------------------------------------------------------------
 AYAKA_BASE = "https://ayakamods.com"
 
+# /mods/ 下面这些段是站点的功能页，不是模组。用户很容易把「列表页」地址
+# 粘进来（他那条地址栏里就是 /mods/games/helldivers-2.119/）。
+# 以前会把 "games" 当 slug 去查，然后报"页面结构变了"，把人引到错误方向。
+AYAKA_RESERVED = ("games", "categories", "tags", "members", "history", "download",
+                  "search", "mods", "authors", "faq")
+
+# slug 的字符范围：**不能**写死成 [a-z0-9-.] —— 实测站点上约三分之一的
+# 模组是中文名（尤其中文社区的汉化/功能 mod），它们的 slug 是百分号编码的，
+# 形如 %E6%9C%BA%E7%94%B2%E9%83%A8%E4%BD%8D%E8%A1%80%E9%87%8FHUD.4775。
+# 写死字符集会把这些 mod 整个漏掉（索引里一个都进不去、手动填也认不出）。
+_AYAKA_SLUG = r'[^"/?#]+'
+
+
+def ayaka_decode(slug: str) -> str:
+    """把 slug 里的百分号编码还原成人能看的字（显示、比较用）。"""
+    return urllib.parse.unquote(str(slug or ""))
+
+
+def ayaka_encode(slug: str) -> str:
+    """把 slug 规范成可安全放进 URL 的形态。
+
+    站点的 href 里已经是百分号编码；但用户从地址栏复制过来的可能是
+    **原样中文**（浏览器会显示解码后的样子）。裸中文直接塞进
+    urllib.request 会抛 UnicodeEncodeError，所以统一在这里规范化。
+
+    做法是「先解码、再整体编码」，**不把 ``%`` 放进 safe**。
+    为什么：如果 safe 里保留 ``%``，那么输入里本来就有的裸百分号
+    （如 ``100%.456``）会被原样留下来，下一次再编码时它又被当成转义前缀
+    吃掉后面的字符 —— 实测 ``%25477.123`` 会变成 ``%477.123``、
+    再变 ``G7.123``，越编越烂。去掉 safe 里的 ``%`` 之后，
+    裸百分号会被规范成 ``%25``，函数就是**幂等**的了
+    （encode(encode(x)) == encode(x)），这对"用户反复粘贴/反复保存"很要紧。
+    """
+    s = str(slug or "").strip().strip("/")
+    # quote 默认就会保留字母/数字/_.-~，safe 里不必再列一遍
+    return urllib.parse.quote(urllib.parse.unquote(s), safe="")
+
+
+def ayaka_slug(text: str) -> str:
+    """从「完整网址」或「裸 slug」里取出 slug（保持站点上的原样编码）。
+
+    容忍末尾没有斜杠、带 ?query 尾巴（用户从地址栏复制的常见形态）。
+    """
+    t = str(text or "").strip()
+    if not t:
+        return ""
+    m = re.search(r"/mods/(" + _AYAKA_SLUG + r")(?:/|\?|#|$)", t, re.I)
+    if m:
+        return m.group(1)
+    if t.startswith("http"):
+        return ""
+    return t.strip("/")
+
+
+def ayaka_url(slug: str) -> str:
+    """拼出模组页地址（唯一出处，别再各处手写 f-string）。"""
+    return f"{AYAKA_BASE}/mods/{ayaka_encode(slug)}/"
+
+
+def ayaka_is_reserved(slug: str) -> bool:
+    """这个 slug 是不是 /mods/ 下的功能页（不是模组）。"""
+    return ayaka_decode(slug).strip().lower() in AYAKA_RESERVED
+
+
+# --------------------------------------------------------------------------
+# 从用户粘贴的网址判断来源站点
+# --------------------------------------------------------------------------
+# GitHub 的这几段不是仓库路径（用户可能粘了令牌页/设置页的地址）
+_GITHUB_NOT_REPO = (
+    "settings", "features", "about", "pricing", "marketplace",
+    "orgs", "login", "signup", "notifications", "explore",
+)
+
+
+def detect_source(text: str) -> dict | None:
+    """从用户粘贴的内容判断来源站点。
+
+    返回 ``{"provider","id","url","display"}``，认不出返回 None。
+
+    设计意图：用户只需粘贴模组的**页面地址**，不用管是哪个站点、不用管
+    该填 ID 还是仓库名 —— 由程序识别。也容忍偷懒写法（不带 https://、
+    带尾巴参数、GitHub 带 /releases/tag/... 等）。
+
+    **专门支持中文/特殊符号的 ayakamods 地址**：实测站点上约三分之一的
+    模组是中文名，它们的地址长这样（浏览器地址栏里显示的就是解码后的样子）：
+        https://ayakamods.com/mods/机甲部位血量HUD.4775/
+    复制过来可能是上面这种**原样中文**（浏览器会解码显示），也可能是
+    页面源码里的百分号编码形态。两种都必须认出来 —— 旧实现的正则写死了
+    [a-z0-9\\-]，中文地址一律返回 None，用户会被告知"认不出这是哪个站点的
+    链接"，而地址明明是好的（他自己手动指定来源这条路就被堵死了）。
+
+    ``display`` 是给人看的地址（中文还原后的），``url`` 是真正要用的形态。
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+
+    # --- 先按用户原样判断「裸写法」（不带 http 的一律补 https://）---
+    # README 和对话框里都给用户写过「GitHub 填 作者/仓库、Nexus 填数字 ID」，
+    # 但老实现只认完整网址 —— 用户照着文档填反而被告知"认不出"，很打脸。
+    # 这里把这几种裸写法也一并认掉。
+    if not re.match(r"^https?://", t, re.I):
+        bare = t.strip().strip("/")
+
+        # 带 "mods/" 前缀的（用户从地址栏里只拖了一半的常见形态）：
+        # 先按 ayakamods 判断，**不要**掉进下面的「作者/仓库」分支 ——
+        # 否则 "mods/hd2runtime.4260" 会被编成
+        # github.com/mods/hd2runtime.4260 这种根本不存在的仓库，
+        # 而且因为标了 manual 就再也不会被自动纠正。
+        if bare.lower().startswith("mods/"):
+            rest = bare[5:].strip("/")
+            if re.fullmatch(r"\d{1,8}", rest):
+                url = f"https://www.nexusmods.com/helldivers2/mods/{rest}"
+                return {"provider": "nexus", "id": rest, "url": url,
+                        "display": url}
+            if re.fullmatch(r".+\.\d+", rest) and not ayaka_is_reserved(rest):
+                enc = ayaka_encode(rest)
+                return {"provider": "ayaka", "id": enc, "url": ayaka_url(enc),
+                        "display": f"{AYAKA_BASE}/mods/{ayaka_decode(enc)}/"}
+            return None
+
+        # 裸 slug：形如 "名字.数字"（中文名也满足）
+        if ("/" not in bare and re.fullmatch(r".+\.\d+", bare)
+                and re.search(r"[^\d.]", bare)
+                and not ayaka_is_reserved(bare)):
+            enc = ayaka_encode(bare)
+            return {"provider": "ayaka", "id": enc,
+                    "url": ayaka_url(enc),
+                    "display": f"{AYAKA_BASE}/mods/{ayaka_decode(enc)}/"}
+
+        # N 网裸编号
+        m = re.fullmatch(r"(\d{1,8})", bare)
+        if m:
+            mid = m.group(1)
+            url = f"https://www.nexusmods.com/helldivers2/mods/{mid}"
+            return {"provider": "nexus", "id": mid, "url": url, "display": url}
+
+        # GitHub 裸「作者/仓库」
+        m = re.fullmatch(r"([A-Za-z0-9_.\-]+)/([A-Za-z0-9_.\-]+?)(?:\.git)?", bare)
+        if m and m.group(1).lower() not in _GITHUB_NOT_REPO:
+            repo = f"{m.group(1)}/{m.group(2)}"
+            url = f"https://github.com/{repo}"
+            return {"provider": "github", "id": repo, "url": url, "display": url}
+
+        t = "https://" + t.lstrip("/")
+
+    low = t.lower()
+
+    # --- GitHub：只要域名对，取 作者/仓库 ---
+    if "github.com" in low:
+        m = re.search(r"github\.com/([^/]+)/([^/#?\s]+)", t, re.I)
+        if not m:
+            return None
+        repo = re.sub(r"\.git$", "", f"{m.group(1)}/{m.group(2)}")
+        if repo.split("/")[0].lower() in _GITHUB_NOT_REPO:
+            return None
+        url = f"https://github.com/{repo}"
+        return {"provider": "github", "id": repo, "url": url, "display": url}
+
+    # --- Nexus：取数字 ID ---
+    if "nexusmods.com" in low:
+        m = re.search(r"/mods/(\d+)", t) or re.search(r"[?&]id=(\d+)", t)
+        if not m:
+            return None
+        mid = m.group(1)
+        url = f"https://www.nexusmods.com/helldivers2/mods/{mid}"
+        return {"provider": "nexus", "id": mid, "url": url, "display": url}
+
+    # --- ayakamods：取 slug（含中文/百分号编码两种形态）---
+    if "ayakamods.com" in low:
+        slug = ayaka_slug(t)
+        if not slug or ayaka_is_reserved(slug):
+            return None
+        enc = ayaka_encode(slug)
+        return {"provider": "ayaka", "id": enc,
+                "url": ayaka_url(enc),
+                "display": f"{AYAKA_BASE}/mods/{ayaka_decode(enc)}/"}
+    return None
+
 
 def ayaka_check(slug_or_url: str) -> dict:
     """抓 ayakamods 模组页，取版本号与「最后更新」时间。
 
-    slug_or_url 可以是完整 URL，也可以是 'hd2runtime.4260' 这样的 slug。
+    slug_or_url 可以是完整 URL（含中文/特殊符号，编码与否都行），
+    也可以是 'hd2runtime.4260' 这样的裸 slug。
     """
     out = _empty("ayaka")
     raw = (slug_or_url or "").strip()
     if not raw:
         out["error"] = "没给 ayakamods 地址"
         return out
-    if raw.startswith("http"):
-        url = raw if raw.endswith("/") else raw + "/"
-        m = re.search(r"/mods/([a-z0-9\-\.]+)/", url, re.I)
-        slug = m.group(1) if m else ""
-    else:
-        slug = raw.strip("/")
-        url = f"{AYAKA_BASE}/mods/{slug}/"
+    slug = ayaka_slug(raw)
+    if not slug:
+        out["url"] = raw
+        out["error"] = ("这个地址里没看出模组编号。请粘模组页面的地址"
+                        "（形如 ayakamods.com/mods/名字.数字/）。")
+        return out
+    if ayaka_is_reserved(slug):
+        out["url"] = raw
+        out["error"] = ("这是 ayakamods 的列表页/功能页地址，不是某个模组的页面。"
+                        "请先打开那个模组，再复制它的地址。")
+        return out
+    slug = ayaka_encode(slug)
+    url = ayaka_url(slug)
     out["url"] = url
     out["slug"] = slug
 
@@ -612,8 +811,19 @@ def ayaka_check(slug_or_url: str) -> dict:
         r"<dt>\s*Last update\s*</dt>\s*<dd[^>]*>.*?title=\"([^\"]+)\"",
         r"<dt>\s*Last update\s*</dt>\s*<dd[^>]*>(.*?)</dd>",
     )
-    title = field(r"<h1 class=\"p-title-value\">(.*?)</h1>")
-    out["title"] = title
+    # 标题：页面上的真实结构是 `<h1> 名字 <span class="u-muted">版本</span> </h1>`
+    # （**不带** class="p-title-value" —— 旧正则一直没匹配上，标题永远是空的）。
+    # 先把版本那个 span 去掉再取文本，否则标题会拖着一个版本号，
+    # 拿去跟本地名字比相似度会被拉低。
+    title = field(r'<meta property="og:title" content="([^"]*)"')
+    if not title:
+        m = re.search(r"<h1[^>]*>(.*?)</h1>", html, re.S | re.I)
+        if m:
+            inner = re.sub(r'<span[^>]*class="u-muted"[^>]*>.*?</span>', " ",
+                           m.group(1), flags=re.S | re.I)
+            title = re.sub(r"<[^>]+>", "", inner).strip()
+    title = re.sub(r"\s*-\s*Mod for Helldivers 2\s*$", "", title, flags=re.I)
+    out["title"] = unescape_html(title)
     out["version"] = version
     out["updated"] = updated
 
@@ -646,6 +856,10 @@ def ayaka_list_page(page: int = 1) -> list[dict]:
                 <div class="cMMBodyTitle">标题</div>
                 <div class="cMMBodyText">描述</div>
               </div>
+
+    slug 一律**保持站点上的百分号编码**（如 %E6%9C%BA%E7%94%B2....4775）——
+    它是 URL 里真正要用的形态，拿去请求不会再被编码一次。
+    给人看的时候用 ayaka_decode() 还原。
     """
     url = (
         f"{AYAKA_BASE}/mods/games/helldivers-2.119/"
@@ -664,13 +878,14 @@ def ayaka_list_page(page: int = 1) -> list[dict]:
     # 按卡片切块，逐块抓 slug / 标题 / 作者 / 描述
     blocks = re.split(r'class="cardModMainWrapperLink', html)
     for blk in blocks[1:]:
-        m_slug = re.search(r'href="/mods/([a-z0-9\-\.]+)/"\s+class="modCardLink"', blk, re.I)
+        m_slug = re.search(
+            r'href="/mods/(' + _AYAKA_SLUG + r')/"\s+class="modCardLink"', blk, re.I)
         if not m_slug:
-            m_slug = re.search(r'href="/mods/([a-z0-9\-\.]+)/"', blk, re.I)
+            m_slug = re.search(r'href="/mods/(' + _AYAKA_SLUG + r')/"', blk, re.I)
         if not m_slug:
             continue
         slug = m_slug.group(1)
-        if slug in seen:
+        if slug in seen or ayaka_is_reserved(slug):
             continue
         seen.add(slug)
 
@@ -684,19 +899,22 @@ def ayaka_list_page(page: int = 1) -> list[dict]:
                 author = m_u2.group(1) if m_u2 else ""
 
         m_t = re.search(r'class="cMMBodyTitle"[^>]*>([^<]{1,200})', blk)
-        title = m_t.group(1).strip() if m_t else ""
+        title = unescape_html(m_t.group(1).strip()) if m_t else ""
         if not title:
             m_img = re.search(r'<img[^>]*alt="([^"]{1,200})"', blk)
             if m_img:
-                title = m_img.group(1).strip()
+                title = unescape_html(m_img.group(1).strip())
 
         m_d = re.search(r'class="cMMBodyText"[^>]*>([^<]{1,300})', blk)
-        desc = m_d.group(1).strip() if m_d else ""
+        desc = unescape_html(m_d.group(1).strip()) if m_d else ""
 
         items.append(
             {
                 "slug": slug,
-                "title": title or slug.rsplit(".", 1)[0].replace("-", " "),
+                # 标题取不到时，用**解码后**的 slug 兜底 —— 原来直接拿
+                # 编码串把 "-" 换成空格，中文 mod 会显示成一串 %E6%9C...
+                "title": title or ayaka_decode(
+                    slug.rsplit(".", 1)[0].replace("-", " ")),
                 "author": author,
                 "desc": desc,
             }
@@ -704,8 +922,13 @@ def ayaka_list_page(page: int = 1) -> list[dict]:
     return items
 
 
-def ayaka_crawl(max_pages: int = 30) -> list[dict]:
-    """把 HD2 模组列表整个爬下来（用于本地搜索索引）。"""
+def ayaka_crawl(max_pages: int = 80) -> list[dict]:
+    """把 HD2 模组列表整个爬下来（用于本地搜索索引）。
+
+    max_pages 只是**上限**：翻到空页（或整页都是重复的）就停，所以调高它
+    不花额外时间。原来写 30 页，而站点 2026-10 已经 44 页了 —— 排在后面的
+    老模组会整段进不了索引，正是"有些模组识别不出来"的一个来源。
+    """
     allitems: dict[str, dict] = {}
     for page in range(1, max_pages + 1):
         got = ayaka_list_page(page)

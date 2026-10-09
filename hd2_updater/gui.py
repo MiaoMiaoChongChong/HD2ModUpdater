@@ -35,9 +35,11 @@ from .engine import (
     Engine,
     apply_download_records,
     clear_auto_sources,
+    clear_source,
     download,
     load_sources,
     open_in_browser,
+    restore_sources as engine_restore_sources,
     save_sources,
     set_manual_source,
     source_key,
@@ -231,8 +233,18 @@ class App(tk.Tk):
         # 检查数据目录是否发生回退（自定义位置不可用时，app_data_dir 会兜底）
         self.after(80, self._warn_if_data_dir_fallback)
         self.after(100, self._warn_if_watch_mismatch)
-        self.after(120, self._auto_detect)
+        # 存下 id：这个探测会重建整张表并清掉当前选中行，所以必须能被取消
+        # （测试要在假库上验证别的流程时就得先把它关掉，否则会踩到
+        #   "操作的是上一秒那一行"的时序陷阱）。
+        self._startup_detect_id = self.after(120, self._auto_detect)
         self.after(150, self._pump)
+
+    def cancel_startup_detect(self) -> None:
+        """取消启动时排队的那次 Arsenal 位置探测。"""
+        try:
+            self.after_cancel(self._startup_detect_id)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _warn_if_data_dir_fallback(self) -> None:
         """自定义数据目录不可用时，明确告诉用户（而不是让他看到莫名报错）。"""
@@ -441,6 +453,8 @@ class App(tk.Tk):
         self.menu.add_separator()
         self.menu.add_command(label="复制链接", command=self._ctx_copy)
         self.menu.add_command(label="指定来源…", command=self._ctx_set_source)
+        self.menu.add_command(label="撤销来源并重新识别",
+                             command=self._ctx_undo_source)
         self.menu.add_separator()
         self.menu.add_command(label="打开下载目录", command=self._open_dl_dir)
 
@@ -506,45 +520,66 @@ class App(tk.Tk):
             messagebox.showerror("读取失败", str(e))
 
     # ---------------------------------------------------------- 表格填充
+    def _initial_rows(self) -> list[dict]:
+        """还没检查过的「底表」：库里每个模组一行，状态是「未检查 / 没来源」。
+
+        但**要把已知来源显示出来**，免得表格说"没来源"、双击点进去却又看到
+        来源（自相矛盾）。
+        """
+        saved = load_sources()
+        rows = []
+        for e in self.library:
+            srcs = saved.get(source_key(e)) or []
+            known = None
+            if srcs:
+                s0 = srcs[0]
+                known = {
+                    "provider": s0.get("provider", ""),
+                    "url": s0.get("url") or "",
+                    "how": "已保存的来源（还没检查版本）",
+                    "manual": bool(s0.get("manual")),
+                }
+                if not known["url"]:
+                    if s0.get("provider") == "nexus" and s0.get("id"):
+                        known["url"] = (
+                            f"https://www.nexusmods.com/helldivers2/mods/{s0['id']}"
+                        )
+                    elif s0.get("provider") == "github" and s0.get("id"):
+                        known["url"] = f"https://github.com/{s0['id']}"
+                    elif s0.get("provider") == "ayaka" and s0.get("id"):
+                        # 走 ayaka_url()：中文 mod 的来源 id 是百分号编码的，
+                        # 这里再手写一遍拼接容易漏掉编码处理。
+                        known["url"] = providers.ayaka_url(s0["id"])
+            rows.append(
+                {
+                    "entry": e,
+                    "status": ST_UNCHECKED if known else ST_NO_SOURCE,
+                    "installed": e.get("installed_version", ""),
+                    "best": known,
+                    "checks": [],
+                }
+            )
+        return rows
+
+    def _ensure_full(self, rows: list[dict]) -> list[dict]:
+        """保证列表覆盖库里**所有**模组，缺的补成底表那一行。
+
+        为什么需要：增量检查（「只检查这一个」「只查未检查的」、以及撤销来源后
+        的重查）返回的**只含被查的那几条**。原来把结果直接合并进 self.results，
+        而 self.results 在"还没做过完整检查"时是空的 —— 于是表格被压成只剩
+        那一条，用户会以为"我 20 个模组丢了 19 个"。
+        """
+        have = {source_key(r.get("entry") or {}) for r in rows}
+        missing = [r for r in self._initial_rows()
+                   if source_key(r["entry"]) not in have]
+        return list(rows) + missing
+
     def _populate(self, results: list[dict] | None = None) -> None:
         self.tree.delete(*self.tree.get_children())
         self._row_widgets.clear()
 
         if results is None:
-            # 还没检查：状态是「未检查」，但**要把已知来源显示出来**，
-            # 免得表格说"没来源"、双击点进去却又看到来源（自相矛盾）。
-            saved = load_sources()
-            rows = []
-            for e in self.library:
-                srcs = saved.get(source_key(e)) or []
-                known = None
-                if srcs:
-                    s0 = srcs[0]
-                    known = {
-                        "provider": s0.get("provider", ""),
-                        "url": s0.get("url") or "",
-                        "how": "已保存的来源（还没检查版本）",
-                        "manual": bool(s0.get("manual")),
-                    }
-                    if not known["url"]:
-                        if s0.get("provider") == "nexus" and s0.get("id"):
-                            known["url"] = (
-                                f"https://www.nexusmods.com/helldivers2/mods/{s0['id']}"
-                            )
-                        elif s0.get("provider") == "github" and s0.get("id"):
-                            known["url"] = f"https://github.com/{s0['id']}"
-                        elif s0.get("provider") == "ayaka":
-                            known["url"] = (f"https://ayakamods.com/mods/"
-                                            f"{str(s0.get('id','')).strip('/')}/")
-                rows.append(
-                    {
-                        "entry": e,
-                        "status": ST_UNCHECKED if known else ST_NO_SOURCE,
-                        "installed": e.get("installed_version", ""),
-                        "best": known,
-                        "checks": [],
-                    }
-                )
+            rows = self._initial_rows()
         else:
             # 叠加「已下载」状态：同一个线上版本若已经下过，就不再催着下
             rows = apply_download_records(results)
@@ -848,19 +883,19 @@ class App(tk.Tk):
         def run() -> None:
             try:
                 eng.load()
-                if incremental:
-                    # 增量：只解析这些模组的来源，不重建索引、不动其他结果
-                    self.msgq.put(("log", f"只检查选中的 {len(only_keys)} 个模组…"))
-                    eng.resolve_sources()
-                else:
-                    self.msgq.put(("log", "开始解析来源…"))
-                    eng.resolve_sources()
+                # 增量模式只解析选中的那几条 —— 原来这里没传 only_keys，
+                # 「只检查这一个」会把整库的来源解析全跑一遍（含 GitHub 搜索），
+                # 白等十几秒还烧配额。
+                eng.resolve_sources(only_keys=only_keys)
                 if eng.cancelled:
                     return
                 self.msgq.put(("log", "开始检查更新…"))
                 res = eng.check(only_keys=only_keys)
-                if not incremental:
-                    eng.persist_resolved()
+                # 增量也要落盘：否则「撤销来源并重新识别」新认出来的来源只活在
+                # 这次运行的内存里，重启后又变回"没来源"，用户会以为撤销没生效。
+                # persist_resolved 只补**高可信**且**盘上没有的** key，
+                # 而且是重新读盘后合并，不会覆盖手工记录或别的行。
+                eng.persist_resolved()
                 self.msgq.put(("done_partial" if incremental else "done",
                                res))
             except Exception as e:  # noqa: BLE001
@@ -898,172 +933,198 @@ class App(tk.Tk):
         self._start_check(only_keys={source_key(w["entry"])})
 
     def _pump(self) -> None:
-        """主线程消费后台消息。"""
+        """主线程消费后台消息。
+
+        ★ 整个处理过程必须**绝对不会**中断重排程：这个函数是界面唯一的心跳，
+        它一旦不再排队，进度条、状态栏、下载回调、接力消息就全部静默停摆，
+        用户看到的是一个"点什么都没反应"的窗口，而控制台只留一行 traceback。
+        所以外层用 except 兜住任何异常（记录到状态栏，而不是让它冒出去），
+        重排程放在 finally 里 —— 无论中途发生什么，心跳都必须继续。
+        """
         try:
             while True:
                 kind, payload = self.msgq.get_nowait()
-                if kind == "prog":
-                    d, t, m = payload
-                    self.prog.configure(maximum=max(1, t), value=d)
-                    self.var_status.set(f"{m}  ({d}/{t})")
-                elif kind == "log":
-                    self.var_status.set(str(payload))
-                elif kind == "done":
-                    self.btn_check.configure(state="normal", text="检查更新")
-                    self.btn_find.configure(state="normal")
-                    self.prog.configure(value=0)
-                    self.results = payload
-                    self._populate(payload)
-                    upd = sum(1 for r in payload if r["status"] == ST_UPDATE)
-                    self.var_status.set(
-                        f"检查完成：{upd} 个有更新" if upd else "检查完成：没有正式版更新"
-                    )
-                elif kind == "done_partial":
-                    # 增量检查：把新结果**合并**回原有列表，其余保持不变
-                    self.btn_check.configure(state="normal", text="检查更新")
-                    self.btn_find.configure(state="normal")
-                    self.prog.configure(value=0)
-                    fresh = {source_key(r["entry"]): r for r in payload}
-                    merged = []
-                    for r in (self.results or []):
-                        k = source_key(r["entry"])
-                        merged.append(fresh.pop(k, r))   # 有新的就用新的
-                    merged.extend(fresh.values())         # 之前没有的补进来
-                    self.results = merged
-                    self._populate(merged)
-                    upd = sum(1 for r in merged if r["status"] == ST_UPDATE)
-                    self.var_status.set(
-                        f"已更新 {len(payload)} 个模组；当前共 {upd} 个有更新"
-                    )
-                elif kind == "found":
-                    n, total = payload
-                    self.btn_find.configure(state="normal", text="识别来源")
-                    self.btn_check.configure(state="normal")
-                    self.prog.configure(value=0)
-                    self.var_status.set(f"来源识别完成：{n}/{total} 个已识别")
-                    # 重新读一遍来源表，刷新表格里的「来源」列
-                    self._populate()
-                    if n < total:
-                        messagebox.showinfo(
-                            "识别完成",
-                            f"已识别 {n}/{total} 个模组的来源。\n\n"
-                            f"剩下 {total - n} 个没找到 —— 这些右键「指定来源…」"
-                            f"手动贴一次页面地址即可（贴一次就长期记住）。\n\n"
-                            f"现在可以点「检查更新」去查版本了。",
-                        )
-                    else:
-                        messagebox.showinfo(
-                            "识别完成",
-                            f"{total} 个模组的来源全部识别到了。\n\n"
-                            f"现在点「检查更新」就会去查每个网站上的最新版本。",
-                        )
-                elif kind == "index_done":
-                    self.prog.stop()
-                    self.prog.configure(mode="determinate", value=0)
-                    self.var_status.set(f"索引重建完成：{payload} 个模组")
-                    messagebox.showinfo(
-                        "索引重建完成",
-                        f"已抓取 {payload} 个 ayakamods 模组到本地索引。\n\n"
-                        f"现在可以点「识别来源」或「检查更新」了。",
-                    )
-                elif kind == "index_fail":
-                    self.prog.stop()
-                    self.prog.configure(mode="determinate", value=0)
-                    self.var_status.set("索引重建失败")
-                    messagebox.showerror("索引重建失败", str(payload))
-                elif kind == "handoff":
-                    ok, dest, moved, failed = payload
-                    if not ok and not failed:
-                        # 压根没扫到新文件
-                        self.var_status.set("接力：没等到新文件")
-                        messagebox.showinfo(
-                            "没等到文件",
-                            "15 分钟内没在监视的文件夹里发现新的压缩包。\n\n"
-                            "可能原因：\n"
-                            "· 还没点下载，或没下完（N网免费账号有等待时间）\n"
-                            "· 浏览器的下载位置和监视的不一样\n"
-                            "  （到「设置…→下载位置」里改成实际位置）\n\n"
-                            "也可以手动把下好的文件拖进工具的下载夹。",
-                        )
-                    elif failed:
-                        # 扫到了但没搬成 —— 必须如实说，不能报"已收到"。
-                        # 实测踩过：跨盘搬移失败时仍弹"已收到文件（0 个）"，
-                        # 用户看着文件还在下载夹里，完全对不上。
-                        self.var_status.set(f"接力：{len(failed)} 个文件没搬成功")
-                        detail = "\n".join(f"· {n}\n  {e}" for n, e in failed[:5])
-                        more = f"\n…另有 {len(failed) - 5} 个" if len(failed) > 5 else ""
-                        if moved:
-                            messagebox.showwarning(
-                                "部分文件没搬成",
-                                f"成功搬走 {moved} 个，但有 {len(failed)} 个没搬动：\n\n"
-                                f"{detail}{more}\n\n"
-                                f"列表里已搬走的那几条会标成「已下载」。\n"
-                                f"没搬动的还留在原文件夹里，你可以手动移过来。",
-                            )
-                        else:
-                            messagebox.showerror(
-                                "文件没能搬过来",
-                                f"在下载文件夹里找到了 {len(failed)} 个文件，"
-                                f"但搬到工具下载夹时失败了：\n\n"
-                                f"{detail}{more}\n\n"
-                                f"文件还在原来的下载文件夹里，没有丢，"
-                                f"但工具这次没收到它。\n\n"
-                                f"可以到「设置…→下载位置」把两个位置改到同一块盘上，"
-                                f"或者手动把文件移过来。",
-                            )
-                    else:
-                        self.var_status.set(f"接力收到 {moved} 个文件 → {dest}")
-                        # 重画，让这一条变成「已下载」
-                        if self.results:
-                            self._populate(self.results)
-                        messagebox.showinfo(
-                            "已收到文件",
-                            f"收到 {moved} 个文件，已放进：\n  {dest}\n\n"
-                            f"列表里这一条已标成「已下载」。\n\n"
-                            f"接下来：在 Arsenal 里用 Add mods / Import 导入，"
-                            f"然后把旧的那份禁用并删除。",
-                        )
-                elif kind == "moved":
-                    ok, msg = payload
-                    # 收尾：停进度条、恢复按钮
-                    self.prog.stop()
-                    self.prog.configure(mode="determinate", value=0)
-                    try:
-                        self._last_settings_dialog._busy(False)
-                    except Exception:  # noqa: BLE001
-                        pass
-                    if not ok:
-                        self.var_status.set("搬移未完成")
-                        messagebox.showerror("搬移失败", msg)
-                    else:
-                        self.var_status.set(f"数据位置已改为 {util.current_data_dir()}，请重启程序")
-                        messagebox.showinfo(
-                            "搬移完成",
-                            f"{msg}\n\n请关闭并重新打开程序，之后就会用新位置。\n\n"
-                            f"（指针文件仍在默认位置，只存一行路径，不影响使用）",
-                        )
-                        try:
-                            self._last_settings_dialog.destroy()
-                        except Exception:  # noqa: BLE001
-                            pass
-                elif kind == "error":
-                    self.btn_check.configure(state="normal", text="检查更新")
-                    self.var_status.set("出错了")
-                    messagebox.showerror("检查失败", str(payload))
-                elif kind == "dl":
-                    self.var_status.set(str(payload))
-                elif kind == "dl_done":
-                    self.btn_dl.configure(state="normal", text="下载全部可自动下载的")
-                    self.var_status.set(str(payload)[:120])
-                    # 下完立刻重画：把这几条变成「已下载」，省得用户以为没成功
-                    if self.results:
-                        self._populate(self.results)
-                    messagebox.showinfo("下载完成", str(payload))
+                try:
+                    self._handle_msg(kind, payload)
+                except Exception as e:  # noqa: BLE001
+                    # 单条消息处理失败不该拖垮整个界面：记下来、继续处理后面的
+                    import traceback
+                    self.var_status.set(f"处理消息时出错（已跳过）：{e}")
+                    print(f"[pump] {kind} 处理失败：{e}\n{traceback.format_exc()}")
         except queue.Empty:
             pass
-        self.after(150, self._pump)
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            self.var_status.set(f"界面刷新出错（已恢复）：{e}")
+            print(f"[pump] {e}\n{traceback.format_exc()}")
+        finally:
+            self.after(150, self._pump)
 
-    # ------------------------------------------------------------ 下载
+    def _handle_msg(self, kind: str, payload) -> None:
+        """处理一条后台消息（从 _pump 里拆出来，便于单独兜异常）。"""
+        if kind == "prog":
+            d, t, m = payload
+            self.prog.configure(maximum=max(1, t), value=d)
+            self.var_status.set(f"{m}  ({d}/{t})")
+        elif kind == "log":
+            self.var_status.set(str(payload))
+        elif kind == "done":
+            self.btn_check.configure(state="normal", text="检查更新")
+            self.btn_find.configure(state="normal")
+            self.prog.configure(value=0)
+            self.results = payload
+            self._populate(payload)
+            upd = sum(1 for r in payload if r["status"] == ST_UPDATE)
+            self.var_status.set(
+                f"检查完成：{upd} 个有更新" if upd else "检查完成：没有正式版更新"
+            )
+        elif kind == "done_partial":
+            # 增量检查：把新结果**合并**回原有列表，其余保持不变。
+            # _ensure_full 会把库里没被选中、因此没结果的那些补回来 ——
+            # 否则首屏（还没完整检查过）做一次增量，整张表会只剩那一行。
+            self.btn_check.configure(state="normal", text="检查更新")
+            self.btn_find.configure(state="normal")
+            self.prog.configure(value=0)
+            fresh = {source_key(r["entry"]): r for r in payload}
+            merged = []
+            for r in (self.results or []):
+                k = source_key(r["entry"])
+                merged.append(fresh.pop(k, r))   # 有新的就用新的
+            merged.extend(fresh.values())         # 之前没有的补进来
+            merged = self._ensure_full(merged)
+            self.results = merged
+            self._populate(merged)
+            # 若是"撤销来源"触发的重查，而它没找到任何来源 → 把原记录放回去
+            self._maybe_restore_after_undo(merged)
+            upd = sum(1 for r in merged if r["status"] == ST_UPDATE)
+            self.var_status.set(
+                f"已更新 {len(payload)} 个模组；当前共 {upd} 个有更新"
+            )
+        elif kind == "found":
+            n, total = payload
+            self.btn_find.configure(state="normal", text="识别来源")
+            self.btn_check.configure(state="normal")
+            self.prog.configure(value=0)
+            self.var_status.set(f"来源识别完成：{n}/{total} 个已识别")
+            # 重新读一遍来源表，刷新表格里的「来源」列
+            self._populate()
+            if n < total:
+                messagebox.showinfo(
+                    "识别完成",
+                    f"已识别 {n}/{total} 个模组的来源。\n\n"
+                    f"剩下 {total - n} 个没找到 —— 这些右键「指定来源…」"
+                    f"手动贴一次页面地址即可（贴一次就长期记住）。\n\n"
+                    f"现在可以点「检查更新」去查版本了。",
+                )
+            else:
+                messagebox.showinfo(
+                    "识别完成",
+                    f"{total} 个模组的来源全部识别到了。\n\n"
+                    f"现在点「检查更新」就会去查每个网站上的最新版本。",
+                )
+        elif kind == "index_done":
+            self.prog.stop()
+            self.prog.configure(mode="determinate", value=0)
+            self.var_status.set(f"索引重建完成：{payload} 个模组")
+            messagebox.showinfo(
+                "索引重建完成",
+                f"已抓取 {payload} 个 ayakamods 模组到本地索引。\n\n"
+                f"现在可以点「识别来源」或「检查更新」了。",
+            )
+        elif kind == "index_fail":
+            self.prog.stop()
+            self.prog.configure(mode="determinate", value=0)
+            self.var_status.set("索引重建失败")
+            messagebox.showerror("索引重建失败", str(payload))
+        elif kind == "handoff":
+            ok, dest, moved, failed = payload
+            if not ok and not failed:
+                # 压根没扫到新文件
+                self.var_status.set("接力：没等到新文件")
+                messagebox.showinfo(
+                    "没等到文件",
+                    "15 分钟内没在监视的文件夹里发现新的压缩包。\n\n"
+                    "可能原因：\n"
+                    "· 还没点下载，或没下完（N网免费账号有等待时间）\n"
+                    "· 浏览器的下载位置和监视的不一样\n"
+                    "  （到「设置…→下载位置」里改成实际位置）\n\n"
+                    "也可以手动把下好的文件拖进工具的下载夹。",
+                )
+            elif failed:
+                # 扫到了但没搬成 —— 必须如实说，不能报"已收到"。
+                # 实测踩过：跨盘搬移失败时仍弹"已收到文件（0 个）"，
+                # 用户看着文件还在下载夹里，完全对不上。
+                self.var_status.set(f"接力：{len(failed)} 个文件没搬成功")
+                detail = "\n".join(f"· {n}\n  {e}" for n, e in failed[:5])
+                more = f"\n…另有 {len(failed) - 5} 个" if len(failed) > 5 else ""
+                if moved:
+                    messagebox.showwarning(
+                        "部分文件没搬成",
+                        f"成功搬走 {moved} 个，但有 {len(failed)} 个没搬动：\n\n"
+                        f"{detail}{more}\n\n"
+                        f"列表里已搬走的那几条会标成「已下载」。\n"
+                        f"没搬动的还留在原文件夹里，你可以手动移过来。",
+                    )
+                else:
+                    messagebox.showerror(
+                        "文件没能搬过来",
+                        f"在下载文件夹里找到了 {len(failed)} 个文件，"
+                        f"但搬到工具下载夹时失败了：\n\n"
+                        f"{detail}{more}\n\n"
+                        f"文件还在原来的下载文件夹里，没有丢，"
+                        f"但工具这次没收到它。\n\n"
+                        f"可以到「设置…→下载位置」把两个位置改到同一块盘上，"
+                        f"或者手动把文件移过来。",
+                    )
+            else:
+                self.var_status.set(f"接力收到 {moved} 个文件 → {dest}")
+                # 重画，让这一条变成「已下载」
+                if self.results:
+                    self._populate(self.results)
+                messagebox.showinfo(
+                    "已收到文件",
+                    f"收到 {moved} 个文件，已放进：\n  {dest}\n\n"
+                    f"列表里这一条已标成「已下载」。\n\n"
+                    f"接下来：在 Arsenal 里用 Add mods / Import 导入，"
+                    f"然后把旧的那份禁用并删除。",
+                )
+        elif kind == "moved":
+            ok, msg = payload
+            # 收尾：停进度条、恢复按钮
+            self.prog.stop()
+            self.prog.configure(mode="determinate", value=0)
+            try:
+                self._last_settings_dialog._busy(False)
+            except Exception:  # noqa: BLE001
+                pass
+            if not ok:
+                self.var_status.set("搬移未完成")
+                messagebox.showerror("搬移失败", msg)
+            else:
+                self.var_status.set(f"数据位置已改为 {util.current_data_dir()}，请重启程序")
+                messagebox.showinfo(
+                    "搬移完成",
+                    f"{msg}\n\n请关闭并重新打开程序，之后就会用新位置。\n\n"
+                    f"（指针文件仍在默认位置，只存一行路径，不影响使用）",
+                )
+                try:
+                    self._last_settings_dialog.destroy()
+                except Exception:  # noqa: BLE001
+                    pass
+        elif kind == "error":
+            self.btn_check.configure(state="normal", text="检查更新")
+            self.var_status.set("出错了")
+            messagebox.showerror("检查失败", str(payload))
+        elif kind == "dl":
+            self.var_status.set(str(payload))
+        elif kind == "dl_done":
+            self.btn_dl.configure(state="normal", text="下载全部可自动下载的")
+            self.var_status.set(str(payload)[:120])
+            # 下完立刻重画：把这几条变成「已下载」，省得用户以为没成功
+            if self.results:
+                self._populate(self.results)
+            messagebox.showinfo("下载完成", str(payload))
+
     def _download_all(self) -> None:
         targets = self._auto_download_targets()
         if not targets:
@@ -1427,6 +1488,109 @@ class App(tk.Tk):
         SourceDialog(self, w["entry"], on_saved=self._after_source_change,
                      on_saved_row=w["entry"])
 
+    def _ctx_undo_source(self) -> None:
+        """撤销来源并重新识别（把手工指定的记录也一并撤掉）。
+
+        为什么需要它：手工指定的来源是**受保护**的，永远不会被自动识别覆盖，
+        「清空来源缓存」也只清自动的。用户一旦手填错（或站点改名了），
+        原来没有办法回到"自动识别"，只能一直用着错的记录 —— 这个菜单就是出口。
+
+        撤销后立刻**只对这一条**重跑识别（不重建索引、不动别的结果），
+        识别完顺手把版本也查了，用户不用再点一次「检查更新」。
+        """
+        w = self._selected()
+        if not w:
+            return
+        entry = w["entry"]
+        key = source_key(entry)
+        label = entry.get("label") or entry.get("dirname") or "(未命名)"
+
+        # ★ 先检查"撤销之后能不能真的重识别"，再做删除这种破坏性动作。
+        #   反过来的话（先删、再发现不能跑）会把来源记录删掉却什么都没补回来，
+        #   用户手里就真的少了一条记录。
+        if not self.data_file:
+            messagebox.showwarning("先选位置",
+                                   "还没找到 Arsenal 模组库，没法重新识别。")
+            return
+        if self._busy_guard():
+            return
+
+        saved = load_sources().get(key) or []
+        if not saved:
+            messagebox.showinfo(
+                "没有来源记录",
+                f"「{label}」现在没有已保存的来源，不需要撤销。\n\n"
+                f"如果它识别不出来，用右键「指定来源…」手动填一次。",
+            )
+            return
+
+        manual = [s for s in saved if s.get("manual")]
+        detail = "\n".join(
+            f"· {PROV_NAME.get(s.get('provider',''), s.get('provider',''))}"
+            f"　{s.get('url') or s.get('id') or ''}"
+            + ("　（手工指定）" if s.get("manual") else "　（自动识别）")
+            for s in saved
+        )
+        # 关掉「智能搜索来源」时，ayakamods 那一路**根本不会被尝试**，
+        # 重识别必然一无所获。这种情况必须先说清楚，别让用户以为删了还能找回来。
+        if not self.var_use_search.get():
+            warn = ("\n\n注意：你现在的「智能搜索来源」是**关闭**状态。\n"
+                    "撤销后就没法自动识别 ayakamods 来源了 —— 如果重识别\n"
+                    "什么也没找到，我会把原来的来源**放回去**，不会丢。")
+        else:
+            warn = ""
+        if not messagebox.askyesno(
+            "撤销来源并重新识别",
+            f"要撤销「{label}」现在的来源记录吗？\n\n{detail}"
+            + ("\n\n注意：其中 " + str(len(manual))
+               + " 条是你手工指定的，也会一起删掉。" if manual else "")
+            + warn
+            + "\n\n撤销后会立刻重新智能识别一次（不会再用手工那条）。"
+              "\n若重识别没找到任何来源，原来的记录会被还原。",
+        ):
+            return
+
+        gone = clear_source(entry)
+        self.var_status.set(f"已撤销「{label}」的 {len(gone)} 条来源，正在重新识别…")
+        # 撤销后这一条先回到「未检查」，别让表里留着旧的结论
+        self._after_source_change(entry)
+        self._undo_restore = {"key": key, "entry": entry, "gone": gone}
+        self._start_check(only_keys={key})
+
+    def _maybe_restore_after_undo(self, rows: list[dict]) -> None:
+        """撤销+重识别之后，如果这一条仍然没有任何来源，就把原记录放回去。
+
+        这是"撤销"的安全网：识别是尽力而为的（用户可能关了智能搜索、
+        索引没建好、或当前离线），失败时宁可恢复成"手工指定"，
+        也不能让用户手工找来的地址凭空消失。
+        """
+        state = getattr(self, "_undo_restore", None)
+        if not state:
+            return
+        key = state["key"]
+        row = next((r for r in rows
+                    if source_key(r.get("entry") or {}) == key), None)
+        if row is not None and row.get("status") != ST_NO_SOURCE:
+            self._undo_restore = None      # 识别到了，不用还原
+            return
+        engine_restore_sources(state["entry"], state["gone"])
+        self._undo_restore = None
+        n = len(state["gone"])
+        self.var_status.set(
+            f"没能重新识别出来源，已把「{state['entry'].get('label') or '这个模组'}」"
+            f"原来的 {n} 条来源放回去了（还是手工指定的那条）。"
+        )
+        messagebox.showinfo(
+            "没找到新来源，已还原",
+            f"重新识别没能找到「{state['entry'].get('label') or '这个模组'}」的来源，"
+            f"所以把原来的 {n} 条记录放回去了，没有丢。\n\n"
+            "可能的原因：\n"
+            "· 「智能搜索来源」是关闭状态（ayakamods 靠它来匹配）\n"
+            "· 站点索引还没建好，或当前网络不通\n"
+            "· 这个模组在 ayakamods 上确实没有对应的页面\n\n"
+            "如果确实想换成别的来源，用右键「指定来源…」直接填新的地址。",
+        )
+
     def _after_source_change(self, entry: dict | None = None) -> None:
         """手工指定来源/版本后，**只刷新这一行**，不动其他检查结果。
 
@@ -1474,7 +1638,7 @@ class App(tk.Tk):
 
     # ---------------------------------------------------------- 其他
     def _rebuild_index(self) -> None:
-        """重建 ayakamods 索引（实测约 90 秒：要翻页爬 500 多个模组）。"""
+        """重建 ayakamods 索引（实测约 2 分钟：要翻页爬 40+ 页、约 870 个模组）。"""
         self.var_status.set("正在重建 ayakamods 索引（约 1~2 分钟，请稍候）…")
 
         # 有进度条的话动起来，让用户知道没卡死
@@ -1616,66 +1780,21 @@ class SourceDialog(tk.Toplevel):
         if prov == "nexus" and ident:
             return f"https://www.nexusmods.com/helldivers2/mods/{ident}"
         if prov == "ayaka" and ident:
-            return f"https://ayakamods.com/mods/{ident.strip('/')}/"
+            # 走 ayaka_url()/ayaka_decode()：存下来的 id 是百分号编码形态
+            # （如 %E6%9C%BA%E7%94%B2....4775）。直接回填编码串会让用户看到
+            # 一坨 %E6%9C 而以为自己粘错了 —— README 明确承诺过"中文地址
+            # 直接粘就行，不用自己转码"，这里回显**解码后的中文**才一致。
+            # （保存时程序会自己再编码，用户看到什么就存什么。）
+            return f"{providers.AYAKA_BASE}/mods/{providers.ayaka_decode(ident)}/"
         return ""
 
     def _detect(self, text: str) -> dict | None:
-        """从网址判断是哪个站点，返回 {'provider','id','url'}；认不出返回 None。
+        """从网址判断是哪个站点，返回 {'provider','id','url','display'}；认不出返回 None。
 
-        设计意图：用户只需粘贴模组的**页面地址**，不用管是哪个站点、不用管
-        该填 ID 还是仓库名 —— 由程序识别。也容忍偷懒写法（不带 https://、
-        带尾巴参数、GitHub 带 /releases/tag/... 等）。
+        真正的判断逻辑放在 ``providers.detect_source()`` —— **GUI 和命令行共用
+        一份**，也方便写离线测试（这里只是薄薄一层转发）。
         """
-        import re
-        t = (text or "").strip()
-        if not t:
-            return None
-
-        # 先按用户原样判断「裸 slug」（只认这个，别的一律补 https://）
-        m = re.fullmatch(r"([a-z0-9][a-z0-9\-]*[a-z0-9])\.(\d+)", t.strip("/"), re.I)
-        if m:
-            slug = f"{m.group(1)}.{m.group(2)}"
-            return {"provider": "ayaka", "id": slug,
-                    "url": f"https://ayakamods.com/mods/{slug}/"}
-
-        if not re.match(r"^https?://", t, re.I):
-            t = "https://" + t.lstrip("/")
-
-        low = t.lower()
-        # GitHub：只要域名对，取 作者/仓库
-        if "github.com" in low:
-            m = re.search(r"github\.com/([^/]+)/([^/#?\s]+)", t, re.I)
-            if m:
-                repo = f"{m.group(1)}/{m.group(2)}"
-                repo = re.sub(r"\.git$", "", repo)
-                # 排除 github.com/settings/... 这类非仓库路径
-                if repo.split("/")[0].lower() in (
-                    "settings", "features", "about", "pricing", "marketplace",
-                    "orgs", "login", "signup", "notifications", "explore",
-                ):
-                    return None
-                return {"provider": "github", "id": repo,
-                        "url": f"https://github.com/{repo}"}
-            return None
-        # Nexus：取数字 ID
-        if "nexusmods.com" in low:
-            m = re.search(r"/mods/(\d+)", t)
-            if not m:
-                m = re.search(r"[?&]id=(\d+)", t)
-            if m:
-                mid = m.group(1)
-                return {"provider": "nexus", "id": mid,
-                        "url": f"https://www.nexusmods.com/helldivers2/mods/{mid}"}
-            return None
-        # ayakamods：取 slug
-        if "ayakamods.com" in low:
-            m = re.search(r"/mods/([a-z0-9\-]+\.\d+)", t, re.I)
-            if m:
-                slug = m.group(1)
-                return {"provider": "ayaka", "id": slug,
-                        "url": f"https://ayakamods.com/mods/{slug}/"}
-            return None
-        return None
+        return providers.detect_source(text)
 
     def _preview(self) -> None:
         """实时提示识别结果。"""
@@ -1688,13 +1807,17 @@ class SourceDialog(tk.Toplevel):
         got = self._detect(text)
         if got:
             name = PROV_NAME.get(got["provider"], got["provider"])
+            # 显示**解码后**的地址：中文 mod 的地址在源码里是 %E6%9C... 一串，
+            # 直接回显会让人以为自己粘错了。
+            show = got.get("display") or got["url"]
             self.lbl_detect.configure(
-                text=f"✓ 识别为 {name}　（{got['url']}）", foreground=GREEN)
+                text=f"✓ 识别为 {name}　（{show}）", foreground=GREEN)
             self.btn_verify.configure(state="normal")
         else:
             self.lbl_detect.configure(
                 text="✗ 认不出这是哪个站点的链接。请确认是 "
-                     "github.com / nexusmods.com / ayakamods.com 的模组页面地址。",
+                     "github.com / nexusmods.com / ayakamods.com 的模组页面地址"
+                     "（ayakamods 的中文名地址也可以直接粘）。",
                 foreground=RED)
             self.btn_verify.configure(state="disabled")
 
@@ -1707,17 +1830,19 @@ class SourceDialog(tk.Toplevel):
         if not got:
             messagebox.showwarning(
                 "认不出这个链接",
-                "请贴这三个站点的模组页面地址（不是下载直链）：\n\n"
+                "请贴这三个站点的模组页面地址（不是下载直链、也不是列表页）：\n\n"
                 "· github.com/作者/仓库\n"
                 "· nexusmods.com/helldivers2/mods/数字\n"
                 "· ayakamods.com/mods/xxx.数字/\n\n"
                 "最省事的做法：在浏览器打开那个模组的页面，\n"
-                "复制地址栏整条链接粘过来。",
+                "复制地址栏整条链接粘过来。\n\n"
+                "（ayakamods 的中文/特殊符号地址也能直接粘，程序认得。）",
                 parent=self,
             )
             return
 
-        set_manual_source(self.entry_data, got)   # 打 manual 标记，受保护
+        set_manual_source(self.entry_data, {
+            k: v for k, v in got.items() if k != "display"})   # 打 manual 标记，受保护
         # 顺便记住用户填的本地版本（用于判断有没有更新）
         uv = self.entry_data.get("uuid") or ""
         if uv:

@@ -41,12 +41,17 @@ def load_sources() -> dict:
 
     ``manual: True`` 的条目是**用户手工填写/确认过的**，
     永远不会被自动识别结果覆盖，也不会被「清空来源缓存」抹掉。
+
+    对损坏的文件一律当空：文件可能被手工编辑坏、或被并发写坏。
+    注意要检查**顶层**是不是 dict —— 只写 `json.load(f) or {}` 的话，
+    一个内容是 `[1,2,3]` 的文件会原样返回 list，后面所有 `.get()` 全炸。
     """
     try:
         with open(sources_path(), encoding="utf-8-sig") as f:
-            return json.load(f) or {}
+            data = json.load(f)
     except Exception:  # noqa: BLE001
         return {}
+    return data if isinstance(data, dict) else {}
 
 
 def save_sources(data: dict) -> None:
@@ -79,6 +84,48 @@ def clear_auto_sources() -> int:
             removed += 1
     save_sources(kept)
     return removed
+
+
+def clear_source(entry: dict) -> list[dict]:
+    """撤销**这一个**模组的来源记录，返回被删掉的那些来源。
+
+    对应右键菜单里的「撤销来源并重新识别」—— 用户手动指定来源后，
+    如果发现指错了（或站点那边改名了），原来没有任何办法回到"自动识别"，
+    只能一直用着那条错的手工记录（手工记录受保护、不会被自动结果覆盖）。
+    这里把这一条记录整个删掉（手工的和自动的都删），删完再重新识别。
+
+    对损坏的 sources.json（手工改坏、值不是列表等）也要**只在它确实是
+    列表时**才当成来源，否则一律当空 —— 否则 `list(123)` 会抛 TypeError，
+    在界面上就是一个没头没尾的报错。注意"先取出、确认没问题、再删"，
+    异常不会发生在删除之后，所以不会出现"删了却没返回"的半成品状态。
+    """
+    data = load_sources()
+    key = source_key(entry)
+    raw = data.get(key)
+    gone = list(raw) if isinstance(raw, list) else []
+    if key in data:
+        del data[key]
+        save_sources(data)
+    return gone
+
+
+def restore_sources(entry: dict, items: list[dict]) -> None:
+    """把 clear_source() 删掉的那些来源**原样放回去**。
+
+    为什么必须有这个：撤销之后要靠自动识别把来源找回来，而识别是
+    "尽力而为" —— 用户关掉了「智能搜索来源」、或索引还没建好、或当前离线时，
+    ayakamods 这一路**根本不会被尝试**，结果必然是空。那时如果只是一句
+    "已撤销"，用户手工找来的地址就永久没了（自动来源删了能重建，
+    手工来源删了就真没了）。
+    所以撤销失败时把原记录还原回去，宁可回到"手工指定"的旧状态，
+    也不能把用户的数据吃掉。
+    """
+    if not items:
+        return
+    data = load_sources()
+    key = source_key(entry)
+    data[key] = items
+    save_sources(data)
 
 
 def source_key(entry: dict) -> str:
@@ -226,10 +273,14 @@ class Engine:
         return self.library
 
     # ------------------------------------------------------- 解析来源
-    def resolve_sources(self, force_search: bool = False) -> None:
+    def resolve_sources(self, force_search: bool = False,
+                        only_keys: set[str] | None = None) -> None:
         """给每个 mod 找出来源。已手工确认过的优先用。
 
         站点索引过期（默认 7 天）会**自动重建**，不需要用户手动点。
+
+        ``only_keys`` 非空时只解析这些模组 —— 用于「撤销来源并重新识别」
+        这种单条操作，免得为一个模组把全库重跑一遍。
         """
         saved = load_sources()
         index: list[dict] = []
@@ -242,8 +293,12 @@ class Engine:
                 self._log(f"使用站点索引（{matcher.index_status_text()}，"
                           f"{len(index)} 个模组）")
 
-        total = len(self.library)
-        for i, entry in enumerate(self.library, 1):
+        todo = [
+            e for e in self.library
+            if only_keys is None or source_key(e) in only_keys
+        ]
+        total = len(todo)
+        for i, entry in enumerate(todo, 1):
             if self.cancelled:
                 return
             key = source_key(entry)
@@ -268,7 +323,10 @@ class Engine:
                 self._log(f"自动识别：{entry.get('label')} -> {auto[0]['provider']}：{auto[0]['how']}")
             else:
                 self.resolved[key] = []
-        self._log(f"来源解析完成：{sum(1 for v in self.resolved.values() if v)}/{total} 个已识别")
+        # 增量模式只看了选中的那几条，分母要用实际处理的条数，
+        # 否则会打出「2/20 个已识别」这种看着像失败的数字。
+        n_done = sum(1 for e in todo if self.resolved.get(source_key(e)))
+        self._log(f"来源解析完成：{n_done}/{total} 个已识别")
 
     # ---------------------------------------------------------- 检查更新
     def check(self, only_keys: set[str] | None = None) -> list[dict]:
