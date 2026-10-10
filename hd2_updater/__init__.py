@@ -3,5 +3,5 @@
 
 只读 Arsenal 的数据，绝不修改。加载与部署交给 Arsenal 自己。
 """
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 APP_NAME = "HD2 Mod Updater"

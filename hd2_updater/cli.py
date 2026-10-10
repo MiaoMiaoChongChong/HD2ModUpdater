@@ -39,6 +39,21 @@ def main(argv: list[str] | None = None) -> int:
     argv = argv or []
     show_all = "--all" in argv
 
+    # 只读自检：不联网，确认「能独立运行 + 版本 + 读得到部署状态」。
+    # 给打包验证用（EXE 拷到空目录、屏蔽 Python 环境变量后跑这条）。
+    if "--selftest" in argv:
+        from . import __version__
+        path, how = find_data_file()
+        print(f"version={__version__}")
+        if not path:
+            print("selftest=FAIL 没找到模组库")
+            return 2
+        lib = load_library(path)
+        dep = sum(1 for e in lib if e.get("deployed"))
+        print(f"mods={len(lib)} deployed={dep} game_dir={bool(lib and lib[0].get('game_dir'))}")
+        print("selftest=OK")
+        return 0
+
     path, how = find_data_file()
     if not path:
         print("没找到 HD2 Arsenal 的模组库（hd2a_data.json）。", file=sys.stderr)

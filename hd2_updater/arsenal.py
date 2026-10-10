@@ -140,13 +140,55 @@ def _resolve_explicit(path: str) -> str | None:
     return None
 
 
+def _deployment_map(data: dict) -> dict:
+    """从 hd2a_data.json 里抽出「当前配置档」的部署状态，按 uuid 索引。
+
+    返回 {uuid: {"enabled":bool, "deployed":bool, "changed":bool, "order":int}}。
+    找不到配置档时返回空 dict（调用方据此把所有模组标成「不在配置档里」）。
+    对损坏结构（不是 dict / mods 不是列表）一律当空，绝不抛异常 —— 库文件可能被
+    手工编辑坏，不能让整个加载崩掉。
+    """
+    mods_list = data.get("modsList")
+    if not isinstance(mods_list, dict) or not mods_list:
+        return {}
+    profile = data.get("selectedProfile")
+    if profile not in mods_list:
+        # 退一步用第一个配置档（用户切换过、selectedProfile 没跟上等情况）
+        profile = next(iter(mods_list))
+    node = mods_list.get(profile)
+    mods = node.get("mods") if isinstance(node, dict) else None
+    if not isinstance(mods, list):
+        return {}
+    out: dict = {}
+    for i, m in enumerate(mods):
+        if not isinstance(m, dict):
+            continue
+        u = m.get("uuid")
+        if not u:
+            continue
+        out[u] = {
+            "enabled": bool(m.get("enabled")),
+            "deployed": bool(m.get("deployed")),
+            "changed": bool(m.get("changed")),
+            "order": i,
+        }
+    return out
+
+
 def load_library(data_file: str) -> list[dict]:
     """读 modsLibrary，返回统一结构的列表。"""
     with open(data_file, encoding="utf-8-sig") as f:
         data = json.load(f)
 
-    # 布局信息也读出来（mods 目录可能在别处）
+    # 布局信息也读出来（mods 目录 / 游戏目录 可能在别处）
     mods_dir = data.get("userModsDir") or ""
+    game_dir = data.get("userGameDir") or ""
+
+    # 部署状态以**当前配置档**（modsList.<selectedProfile>.mods）为准：
+    # 那里每个模组带 enabled/deployed/changed 布尔标志，数组顺序就是加载优先级。
+    # （modsLibrary 是"库"，没有这些标志 —— 早期版本误从它读，导致 enabled/deployed
+    #   恒为 False。这里改成按 uuid 从配置档反查。）
+    deploy = _deployment_map(data)
     # 用户手动修正过的本地版本（按 uuid 记），优先于自动推断
     overrides = (read_config().get("version_overrides") or {})
     lib: list[dict] = []
@@ -154,19 +196,25 @@ def load_library(data_file: str) -> list[dict]:
         path = m.get("path") or ""
         nd = m.get("nexusData") or {}
         dirname = os.path.basename(path.rstrip("\\/")) if path else ""
+        uuid = m.get("uuid") or ""
+        dstate = deploy.get(uuid) or {}
         entry = {
-            "uuid": m.get("uuid") or "",
+            "uuid": uuid,
             "label": (m.get("label") or "").strip(),
             "description": (m.get("description") or "").strip(),
             "path": path,
             "dirname": dirname,
             "mods_dir": mods_dir,
+            "game_dir": game_dir,
             "nexus_mod_id": str(nd.get("modId")) if nd.get("modId") else "",
             "nexus_file_id": str(nd.get("fileId")) if nd.get("fileId") else "",
             "nexus_version": str(nd.get("version")) if nd.get("version") else "",
             "added_at": m.get("addedAt") or "",
-            "enabled": bool(m.get("enabled")),
-            "deployed": bool(m.get("deployed")),
+            "enabled": bool(dstate.get("enabled")),
+            "deployed": bool(dstate.get("deployed")),
+            "deploy_changed": bool(dstate.get("changed")),
+            "deploy_order": dstate.get("order"),
+            "in_profile": bool(dstate),
         }
         auto = (
             entry["nexus_version"]

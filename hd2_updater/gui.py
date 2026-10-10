@@ -108,6 +108,11 @@ HOVER_TIPS = {
                  "· 超过 7 天会自动重建（程序启动时在后台悄悄做）\n"
                  "· 点了「识别来源」时也会按需更新\n\n"
                  "只有当你急着识别新模组、不想等自动流程时才需要手动触发。",
+    "btn_deployed": "只查「部署」列是「✓已部署」的模组有没有新版本。\n\n"
+                    "这些是你游戏里正在用的，优先看它们要不要更新最有效率；\n"
+                    "存在电脑里但没部署到游戏的会被跳过，不查。\n\n"
+                    "比「检查更新」快（模组少、也不重建站点索引）。\n"
+                    "想把全部模组都查一遍就点「检查更新」。",
     "btn_settings": "填写 N网 API key、GitHub token，\n查看下载位置，或清空已识别的来源。",
     "chk_search": "勾选＝检查时自动帮你搜索并识别每个模组的来源页面。\n"
                   "取消勾选＝只用已经确认过的来源，不做新的搜索（更快）。\n"
@@ -383,6 +388,12 @@ class App(tk.Tk):
         self.btn_unchecked.pack(side="left", padx=(8, 0))
         Tooltip(self.btn_unchecked, HOVER_TIPS["btn_unchecked"])
 
+        # 优先检查「已部署」的：这些正装在游戏里，更新它们最要紧
+        self.btn_deployed = ttk.Button(bar, text="检查已部署更新",
+                                       command=self._check_deployed)
+        self.btn_deployed.pack(side="left", padx=(8, 0))
+        Tooltip(self.btn_deployed, HOVER_TIPS["btn_deployed"])
+
         self.btn_settings = ttk.Button(bar, text="设置…", command=self._open_settings)
         self.btn_settings.pack(side="left", padx=(8, 0))
         Tooltip(self.btn_settings, HOVER_TIPS["btn_settings"])
@@ -412,11 +423,12 @@ class App(tk.Tk):
         wrap = ttk.Frame(self, padding=(12, 8))
         wrap.pack(fill="both", expand=True)
 
-        cols = ("status", "label", "local", "remote", "site", "note")
+        cols = ("status", "deploy", "label", "local", "remote", "site", "note")
         self.tree = ttk.Treeview(wrap, columns=cols, show="headings", selectmode="browse")
         heads = {
-            "status": ("状态", 90), "label": ("模组", 330), "local": ("本地", 90),
-            "remote": ("线上", 130), "site": ("来源", 110), "note": ("说明", 380),
+            "status": ("状态", 84), "deploy": ("部署", 62), "label": ("模组", 320),
+            "local": ("本地", 84), "remote": ("线上", 124), "site": ("来源", 100),
+            "note": ("说明", 360),
         }
         for c, (t, w) in heads.items():
             self.tree.heading(c, text=t)
@@ -427,6 +439,9 @@ class App(tk.Tk):
         vs.pack(side="right", fill="y")
         for st_name, col in STATUS_TEXT.values():
             self.tree.tag_configure(st_name, foreground=col)
+        # 部署列的配色（行 tag 优先于它染整行，所以用低优先级 tag）
+        self.tree.tag_configure("dep_yes", foreground=GREEN)
+        self.tree.tag_configure("dep_no", foreground=FG_DIM)
         self.tree.bind("<Double-1>", self._on_row_activate)
         self.tree.bind("<Button-3>", self._on_right_click)
 
@@ -444,6 +459,7 @@ class App(tk.Tk):
         self.menu = tk.Menu(self, tearoff=0, bg=BG3, fg=FG,
                             activebackground=ACCENT, activeforeground="#1b1d21")
         self.menu.add_command(label="只检查这一个", command=self._check_this_one)
+        self.menu.add_command(label="检查所有已部署的", command=self._check_deployed)
         self.menu.add_separator()
         self.menu.add_command(label="下载 / 打开下载页（= 双击这一行）",
                               command=self._on_row_activate)
@@ -574,6 +590,18 @@ class App(tk.Tk):
                    if source_key(r["entry"]) not in have]
         return list(rows) + missing
 
+    @staticmethod
+    def _deploy_cell(e: dict) -> tuple[str, str]:
+        """部署列的（文字, 颜色tag）。e 是模组 entry（arsenal.load_library 给的）。
+
+        已部署 / 启用未部署（在配置档、开了开关但还没部署）/ 未部署（其余）。
+        """
+        if e.get("deployed"):
+            return ("✓已部署", "dep_yes")
+        if e.get("in_profile") and e.get("enabled"):
+            return ("○未部署", "dep_no")
+        return ("—未部署", "dep_no")
+
     def _populate(self, results: list[dict] | None = None) -> None:
         self.tree.delete(*self.tree.get_children())
         self._row_widgets.clear()
@@ -635,9 +663,13 @@ class App(tk.Tk):
             if checks and any((c.get("_src") or {}).get("manual") for c in checks):
                 note = ("【手工指定】" + note).strip()
 
+            deploy_txt, deploy_tag = self._deploy_cell(e)
+
             iid = self.tree.insert(
-                "", "end", values=(txt, label[:60], r.get("installed") or "?", remote, site, note),
-                tags=(STATUS_TEXT.get(r["status"], ("",))[0],),
+                "", "end",
+                values=(txt, deploy_txt, label[:60], r.get("installed") or "?",
+                        remote, site, note),
+                tags=(STATUS_TEXT.get(r["status"], ("",))[0], deploy_tag),
             )
             self._row_widgets.append({"iid": iid, "row": r, "entry": e})
 
@@ -920,6 +952,22 @@ class App(tk.Tk):
             messagebox.showinfo("没有要检查的",
                                 "所有模组都已经检查过了。\n\n"
                                 "如果想全部重查一遍，点「检查更新」。")
+            return
+        self._start_check(only_keys=todo)
+
+    def _deployed_keys(self) -> set[str]:
+        """「已部署」模组的 key 集合（数据以 library 为准，不依赖已检查结果）。"""
+        src = self.library or [r.get("entry") for r in self.results if r.get("entry")]
+        return {source_key(e) for e in src if e and e.get("deployed")}
+
+    def _check_deployed(self) -> None:
+        """优先检查「已部署」的模组 —— 它们正用在游戏里，更新最要紧。"""
+        todo = self._deployed_keys()
+        if not todo:
+            messagebox.showinfo(
+                "没有已部署的模组",
+                "没发现任何「已部署」的模组（部署列没有「✓已部署」）。\n\n"
+                "如果你确实在 Arsenal 里部署过，先点「重新探测」确认读的是当前库。")
             return
         self._start_check(only_keys=todo)
 

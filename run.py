@@ -17,7 +17,7 @@ from hd2_updater.gui import main  # noqa: E402
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] in ("--check", "-c"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("--check", "-c", "--selftest"):
         from hd2_updater.cli import main as cli_main
-        sys.exit(cli_main(sys.argv[2:]))
+        sys.exit(cli_main(sys.argv[1:]))
     main()
