@@ -17,6 +17,7 @@ import json
 import os
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 
 from . import providers
@@ -484,6 +485,75 @@ def disambiguate_ayaka(
 # --------------------------------------------------------------------------
 # 主匹配流程
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# GitHub 搜索结果的会话内缓存（query -> hits）
+#
+# 为什么要有这层：候选评估（candidates_for）必须**保持串行、逐条记录日志**
+# （用户看着识别过程），但 GitHub 搜索本身是纯网络等待、彼此独立。
+# 于是把「搜索」这一步抽出来：识别前用 batch_prefetch_github() **并发**地把
+# 所有要搜的词一次搜完填进这里，之后 candidates_for 走到第 4 步时直接命中
+# 缓存、不再发请求。这样搜索的等待从「逐个串行累加」变成「一次并发并行」，
+# 而评估/日志/落盘的顺序与原来完全一致（测试里对 candidates_for 的桩替换
+# 也因此不受影响）。
+_gh_cache: dict[str, list[dict]] = {}
+_gh_lock = threading.Lock()
+
+
+def _github_search_cached(query: str, token: str = "") -> list[dict]:
+    """github_search 的会话内缓存版：同一批识别里同一 query 只发一次请求。"""
+    key = (query or "").strip()
+    with _gh_lock:
+        if key in _gh_cache:
+            return _gh_cache[key]
+    hits = providers.github_search(query, token)
+    with _gh_lock:
+        _gh_cache[key] = hits
+    return hits
+
+
+def batch_prefetch_github(
+    entries: list[dict],
+    github_token: str = "",
+    max_workers: int = 6,
+    log=None,
+) -> int:
+    """识别前**并发**预搜：把这一批模组可能用到的 GitHub 搜索词一次搜完。
+
+    每个模组最多取 search_terms() 的前 5 组词（与 candidates_for 内部的
+    `tried >= 5` 上限保持一致，别预搜了用不到的白烧配额）。所有词去重后
+    并发请求，结果全部落进 _gh_cache。
+
+    返回实际发起请求的搜索词数（供日志/测试用）。网络失败的词由
+    github_search 自己返回 [] 并同样被缓存 —— 与串行路径行为一致
+    （串行时失败也是拿到 []、继续试下一组词）。
+    """
+    queries: list[str] = []
+    seen: set[str] = set()
+    for e in entries or []:
+        try:
+            terms = search_terms(e)
+        except Exception:  # noqa: BLE001
+            continue
+        for t in terms[:5]:
+            k = (t or "").strip().lower()
+            if k and k not in seen:
+                seen.add(k)
+                queries.append(t)
+    if not queries:
+        return 0
+    if log:
+        log(f"并发预搜 GitHub：{len(queries)} 组词（{len(entries)} 个模组）…")
+
+    def fetch(q: str) -> None:
+        hits = providers.github_search(q, github_token)
+        with _gh_lock:
+            _gh_cache[q.strip()] = hits
+
+    with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
+        list(ex.map(fetch, queries))
+    return len(queries)
+
+
 def candidates_for(
     entry: dict,
     github_token: str = "",
@@ -566,7 +636,9 @@ def candidates_for(
             if tried >= 5:          # 最多试 5 组，别把配额烧光
                 break
             tried += 1
-            hits = providers.github_search(term, github_token)
+            # 命中预填缓存则免发请求（batch_prefetch_github 已并发搜过）；
+            # 缓存里没有才走网络 —— 单条「识别这一个」时也自动退化为联网单搜。
+            hits = _github_search_cached(term, github_token)
             if not hits:
                 continue
             best, bestscore = None, 0.0

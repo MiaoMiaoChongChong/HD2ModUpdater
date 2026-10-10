@@ -29,14 +29,20 @@ UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
-TIMEOUT = 45
+# 单请求超时 45 → 15：三站正常响应都在 1s 内，45s 只会让一个卡死的请求
+# 拖住整批并发；15s + 现有 RETRIES=3 重试，总兜底仍约 45s，够覆盖抖动。
+TIMEOUT = 15
 RETRIES = 3
 
 # ayakamods 在 Cloudflare 后面，请求太密会被拦；同站点逐个请求、间隔数秒
 SLOW_HOSTS = ("ayakamods.com",)
 SLOW_HOST_DELAY = 3.0
-_last_hit: dict[str, float] = {}
 _throttle_lock = threading.Lock()
+# 每线程独立的「上次请求时间」：原来是全局一把锁（_last_hit[host]），
+# 8 个并发查 ayaka 也被压成每 3s 只走一个（5 个 ayaka 模组 = 15s 纯等待）。
+# 改成每线程各自限速：单线程仍守 3s 间隔（Cloudflare 拦的是单源突发，
+# 并不拦"多路并发但每路都守间隔"），而并发场景吞吐随 worker 数上来。
+_thread_last: dict[tuple[int, str], float] = {}
 
 _CTX = ssl.create_default_context()
 
@@ -46,17 +52,18 @@ class NetError(Exception):
 
 
 def throttle(url: str) -> None:
-    """对已知敏感的站点做请求间隔控制（线程安全）。"""
+    """对已知敏感的站点做请求间隔控制（**按线程**限速，线程安全）。"""
     host = next((h for h in SLOW_HOSTS if h in url), None)
     if not host:
         return
+    key = (threading.get_ident(), host)
     with _throttle_lock:
-        prev = _last_hit.get(host)
+        prev = _thread_last.get(key)
         if prev is not None:
             wait = SLOW_HOST_DELAY - (time.monotonic() - prev)
             if wait > 0:
                 time.sleep(wait)
-        _last_hit[host] = time.monotonic()
+        _thread_last[key] = time.monotonic()
 
 
 def http_get(

@@ -243,7 +243,10 @@ class Engine:
         api_key: str = "",
         github_token: str = "",
         use_search: bool = True,
-        max_workers: int = 4,
+        # 并发 4 → 8：三站 API 在这个量级都安全（GitHub 5000 次/小时、
+        # Nexus 个人 key 也远不止），20 个模组从 5 批缩到 3 批，检查近减半。
+        # ayaka 的限速在 util.throttle 里按线程各自控制，不会猛打站点。
+        max_workers: int = 8,
         log=None,
         progress=None,
     ) -> None:
@@ -297,6 +300,21 @@ class Engine:
             e for e in self.library
             if only_keys is None or source_key(e) in only_keys
         ]
+
+        # GitHub 搜索并发预填：只有「真要联网搜」的模组才需要 ——
+        # 盘上已有来源（手工或此前自动识别的）在下面的循环里会直接采纳、
+        # 根本不会走到 GitHub 那一步，提前为它们搜索纯属白烧配额。
+        if self.use_search and not self.cancelled:
+            need = [e for e in todo if not saved.get(source_key(e))]
+            if need:
+                try:
+                    matcher.batch_prefetch_github(
+                        need, self.github_token, log=self._log,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    # 预填失败不该拖垮识别：下面走缓存未命中时会退化为逐条联网搜
+                    self._log(f"GitHub 并发预搜失败（退化为逐条搜索）：{e}")
+
         total = len(todo)
         for i, entry in enumerate(todo, 1):
             if self.cancelled:
