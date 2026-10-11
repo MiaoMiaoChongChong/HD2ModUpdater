@@ -1,0 +1,35 @@
+name: 功能建议
+description: 希望工具支持什么、哪里用起来不顺手
+title: "[建议] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        说清「你想达到什么效果」比说「该怎么实现」更有用 ——
+        同一个效果往往有更简单的做法。
+
+  - type: textarea
+    id: want
+    attributes:
+      label: 你想要什么效果
+      placeholder: 例如：想只更新我启用着的模组，别把没启用的也算进来。
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: 现在哪里不顺手
+      description: 你现在的做法是什么、卡在哪一步。
+    validations:
+      required: false
+
+  - type: textarea
+    id: diag
+    attributes:
+      label: 诊断信息（可选，但很有用）
+      description: 工具 →「反馈 / 帮助」→「生成反馈信息…」→「复制完整诊断」，粘在这里。
+      render: text
+    validations:
+      required: false

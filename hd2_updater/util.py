@@ -127,6 +127,60 @@ def http_get_json(
         raise NetError(f"返回的不是合法 JSON：{e}") from None
 
 
+def http_post_json(
+    url: str,
+    payload: object,
+    headers: dict | None = None,
+    timeout: int = TIMEOUT,
+    retries: int = RETRIES,
+) -> object:
+    """POST（JSON body）并解析 JSON 响应。
+
+    与 :func:`http_get` 保持同一套节流/重试/超时行为 —— 只是提交 JSON。
+    N 网的按名字搜只走 GraphQL（REST v1 没有搜索端点），必须用 POST。
+    """
+    last = ""
+    body_bytes = json.dumps(payload).encode("utf-8")
+    for attempt in range(1, retries + 1):
+        throttle(url)
+        hdrs = {
+            "User-Agent": UA,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8",
+        }
+        if headers:
+            hdrs.update(headers)
+        req = urllib.request.Request(url, data=body_bytes, headers=hdrs,
+                                     method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=_CTX) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+                try:
+                    return json.loads(text)
+                except json.JSONDecodeError as e:
+                    raise NetError(f"返回的不是合法 JSON：{e}") from None
+        except NetError:
+            raise
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", errors="replace")[:200]
+            except Exception:
+                pass
+            last = f"HTTP {e.code} {e.reason} {body}".strip()
+            if e.code in (400, 401, 403, 404):
+                break
+            if 500 <= e.code < 600 and attempt < retries:
+                time.sleep(4 * attempt)
+                continue
+        except Exception as e:  # noqa: BLE001
+            last = f"{type(e).__name__}: {e}"
+        if attempt < retries:
+            time.sleep(2 * attempt)
+    raise NetError(last or "未知错误")
+
+
 # --------------------------------------------------------------------------
 # 版本比较
 # --------------------------------------------------------------------------
@@ -218,6 +272,25 @@ def short_err(text: str, limit: int = 140) -> str:
     return t if len(t) <= limit else t[:limit].rstrip() + "…"
 
 
+def is_cf_block(text: str) -> bool:
+    """这段响应是不是 Cloudflare 的封锁/挑战页（而不是正常内容）。
+
+    为什么要单独判：站点被 CF 挡住时返回的是 403 + 一个 HTML 挑战页，
+    直接把它当"普通 403"翻译成「可能是 Cloudflare 拦截或需要登录」，
+    用户根本不知道该干什么。分开判才能给出**具体出路**。
+    """
+    low = str(text or "").lower()
+    return any(k in low for k in (
+        "you have been blocked",
+        "attention required",
+        "just a moment",
+        "checking your browser",
+        "cf_chl",
+        "cf-error-details",
+        "error 1020",           # access denied
+    ))
+
+
 def friendly_error(err: str) -> str:
     """把底层错误翻译成人话。"""
     s = str(err or "")
@@ -232,7 +305,16 @@ def friendly_error(err: str) -> str:
     if code == "429":
         return "请求太频繁被临时限流——过一会儿再试"
     if code == "403":
-        return "被站点拒绝（HTTP 403）——可能是 Cloudflare 拦截或需要登录"
+        # ★ 被 Cloudflare 挡住时给出**具体出路**，而不是笼统的"可能被拦截"。
+        #   实测（2026-10-11）：ayakamods 对本机出口返回 "you have been blocked"
+        #   （IP 级硬封锁，连真实 Edge 无头浏览器都过不去），换代理节点才可能恢复。
+        if is_cf_block(s):
+            return ("被站点（Cloudflare）挡住了 —— 不是你的网络断了，"
+                    "是站点不接受本机的自动请求。\n"
+                    "可以试：① 换一个代理节点 / 关掉代理再试；"
+                    "② 过一会儿再试；③ 右键「指定来源…」手工填，"
+                    "或直接到浏览器里打开那个页面看版本。")
+        return "被站点拒绝（HTTP 403）——可能需要登录或该内容已下架"
     if code == "401":
         return "需要 API key 或授权（HTTP 401）"
     if "GitHub API 限流" in s:

@@ -28,6 +28,8 @@ from .util import (
     NetError,
     http_get,
     http_get_json,
+    http_post_json,
+    is_cf_block,
     is_prerelease_text,
     parse_date_only,
     friendly_error,
@@ -35,6 +37,62 @@ from .util import (
 )
 
 GITHUB_API = "https://api.github.com"
+# N 网的按名字搜只能走 GraphQL v2（REST v1 没有搜索端点，实测 mods/search 等全 404）
+NEXUS_GQL = "https://api.nexusmods.com/v2/graphql"
+GAME_DOMAIN = "helldivers2"
+
+_NEXUS_SEARCH_Q = """
+query Search($filter: ModsFilter, $count: Int) {
+  mods(filter: $filter, count: $count) {
+    nodes { modId name version author downloads }
+  }
+}
+"""
+
+
+def nexus_search(name: str, api_key: str, count: int = 6,
+                 timeout: int = 12, retries: int = 1) -> list[dict]:
+    """在 N 网**按名字搜**，返回候选列表（按站上相关性排序）。
+
+    为什么需要它：N 网 mod 编号只存在于 N 网自己的下载命名里；从网盘/整合包导入的
+    mod 本地**一点编号线索都没有**（manifest 无 Sources、Arsenal 无 nexusData、
+    目录名也是改过的），这时只能按名字去站上找。
+
+    ★ **返回的是候选，不是答案。** 实测："Vanilla Plus Megapack" 的第一位返回的是
+    它的**中文汉化版**，真身排第二 —— 所以调用方必须做名字核对与置信度判定，
+    **绝不能拿第一位当结论**。
+
+    搜不到/出错都返回空列表（这条路是"尽力而为"，不该让整次检查失败）。
+    """
+    nm = (name or "").strip()
+    if not nm or not api_key:
+        return []
+    payload = {"query": _NEXUS_SEARCH_Q, "variables": {
+        "filter": {"gameDomainName": {"value": GAME_DOMAIN, "op": "EQUALS"},
+                   "name": {"value": nm, "op": "WILDCARD"}},
+        "count": max(1, min(int(count or 6), 20)),
+    }}
+    try:
+        data = http_post_json(NEXUS_GQL, payload,
+                              headers=nexus_headers(api_key),
+                              timeout=timeout, retries=retries)
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(data, dict) or data.get("errors"):
+        return []
+    nodes = (((data.get("data") or {}).get("mods") or {}).get("nodes")) or []
+    out = []
+    for n in nodes:
+        if not isinstance(n, dict) or not n.get("modId"):
+            continue
+        out.append({
+            "mod_id": str(n.get("modId")),
+            "name": str(n.get("name") or ""),
+            "version": str(n.get("version") or ""),
+            "author": str(n.get("author") or ""),
+            "downloads": int(n.get("downloads") or 0),
+        })
+    return out
 
 
 def unescape_html(text: str) -> str:
@@ -76,13 +134,25 @@ def github_headers(token: str = "") -> dict:
 
 def github_check(repo: str, token: str = "", asset_glob: str = "",
                  variant: str = "") -> dict:
-    """查 GitHub 仓库最新 release。
+    """查 GitHub 仓库最新 release（正式版优先，**没有正式版时也能看到测试版**）。
 
-    优先正式版 /releases/latest；若只有预发布版（latest 会 404），
-    退一步列 releases 取最新，并标记 prerelease。
+    ★ 关键：**不要用 `/releases/latest` 当主路径**。
+    GitHub 官方语义是 "The latest release is the most recent **non-prerelease**,
+    non-draft release" —— 也就是说 latest **明确跳过 pre-release**。
+    踩过的坑（2026-10-11，用户质疑「既然 GitHub 上 r42 也是测试版，那不应该
+    优先在 GitHub 上下载吗？」）：本仓库有 `r42-ui-recovery-test`（作者标了
+    prerelease=True）和 `r41`（正式版），而 `/releases/latest` 只返回 `r41`
+    → 工具**根本看不到 r42 测试版**，于是显示成"只有 a 站有测试版更新"，
+    看起来像"GitHub 的 pre-release 没被识别"。实际上是我读错了端点。
 
-    ``variant`` 是本地安装的变体名 —— 一个 release 里放多个变体时
-    （如 Megapack 的 Rows 版），靠它挑对资产而不是"取最大的"。
+    现在的顺序：
+      1. `/releases?per_page=N`（一次拿到全部，含 prerelease）→ 按 GitHub 的
+         发布顺序（它已按 created_at 倒序），**优先取最新的正式版**；
+         若没有任何正式版，取最新的预发布版并标记 prerelease。
+      2. 列表拿不到（限流等）→ 退 atom 源（不占配额）。
+
+    这样"正式版优先、测试版兜底"的语义由**一处**（本函数）保证，
+    engine.evaluate 再按 stable/beta 分类展示，两边一致。
     """
     out = _empty("github")
     repo = (repo or "").strip().strip("/")
@@ -97,8 +167,9 @@ def github_check(repo: str, token: str = "", asset_glob: str = "",
 
     info = None
     try:
-        info = http_get_json(
-            f"{GITHUB_API}/repos/{repo}/releases/latest", headers=github_headers(token)
+        rels = http_get_json(
+            f"{GITHUB_API}/repos/{repo}/releases?per_page=15",
+            headers=github_headers(token),
         )
     except NetError as e:
         msg = str(e)
@@ -106,32 +177,53 @@ def github_check(repo: str, token: str = "", asset_glob: str = "",
             # 退到 atom（不占配额，但没有资产列表）
             return _github_via_atom(repo, out, note="REST 配额受限，改用 atom 源")
         if "404" in msg:
-            # 可能只有预发布版，也可能压根没 release
-            try:
-                rels = http_get_json(
-                    f"{GITHUB_API}/repos/{repo}/releases?per_page=10",
-                    headers=github_headers(token),
-                )
-                rels = [r for r in rels if not r.get("draft")]
-                if not rels:
-                    out["error"] = "该仓库没有任何 release"
-                    return out
-                stable = [r for r in rels if not r.get("prerelease")]
-                info = stable[0] if stable else rels[0]
-                if not stable:
-                    out["note"] = "该仓库只有预发布版，取的是最新的那个"
-            except NetError as e2:
-                return _github_via_atom(repo, out, note=f"REST 失败({short_err(e2)})，改用 atom 源")
-        else:
-            out["error"] = friendly_error(msg)
+            out["error"] = "该仓库没有任何 release"
             return out
+        out["error"] = friendly_error(msg)
+        return out
     except Exception as e:  # noqa: BLE001
         out["error"] = f"意外错误：{short_err(e)}"
         return out
 
-    if not isinstance(info, dict):
+    if not isinstance(rels, list):
         out["error"] = "GitHub 返回了意外的数据"
         return out
+    rels = [r for r in rels if isinstance(r, dict) and not r.get("draft")]
+    if not rels:
+        out["error"] = "该仓库没有任何 release"
+        return out
+    # GitHub 已按发布时间倒序返回 → 第一项就是最新
+    stable = [r for r in rels if not r.get("prerelease")]
+    if stable:
+        info = stable[0]
+    else:
+        info = rels[0]
+        out["note"] = "该仓库只有预发布版，取的是最新的那个"
+
+    # ★★ 附带把"最新的预发布版"也报出来（如果有）。
+    # 为什么需要（2026-10-11 用户质疑「既然 GitHub 上 r42 也是测试版，
+    # 那不应该优先在 GitHub 上下载吗？」）：
+    # 主字段 version 走"正式版优先"（这样"已最新"的判定不会被测试版干扰），
+    # 但如果**仓库里还有一个更新的测试版**，工具在"只有测试版可更"这一档
+    # 也该把 GitHub 作为候选列出来 —— 否则会显示成"只有 a 站有测试版"，
+    # 让人误以为 GitHub 的 pre-release 没被识别。
+    # 这里只填 `prerelease_latest`（版本/链接/资产），由上层决定怎么用。
+    pre = next((r for r in rels if r.get("prerelease")), None)
+    if pre is not None:
+        ptag = str(pre.get("tag_name") or pre.get("name") or "")
+        if ptag and ptag != str(info.get("tag_name") or ""):
+            out["prerelease_latest"] = {
+                "version": ptag,
+                "url": str(pre.get("html_url") or ""),
+                "published": str(pre.get("published_at") or "")[:19].replace("T", " "),
+                "assets": [
+                    {"name": str(a.get("name") or ""),
+                     "url": str(a.get("browser_download_url") or ""),
+                     "size": a.get("size") or 0}
+                    for a in (pre.get("assets") or [])
+                    if str(a.get("name") or "").lower().endswith((".zip", ".7z", ".rar"))
+                ],
+            }
 
     tag = str(info.get("tag_name") or info.get("name") or "")
     out["version"] = tag
@@ -789,9 +881,17 @@ def ayaka_check(slug_or_url: str) -> dict:
         out["error"] = friendly_error(str(e))
         return out
 
-    # 被 Cloudflare 挑战挡住时页面会明显不同
-    if re.search(r"Just a moment|checking your browser|cf_chl", html, re.I):
-        out["error"] = "ayakamods 正在要求人机验证（Cloudflare）——过一会儿再试"
+    # 被 Cloudflare 挡住时页面会明显不同。
+    # ★ 2026-10-11 实测补全：以前只认 "Just a moment"，但站点对本机出口回的是
+    #   "Attention Required! / you have been blocked"（IP 级硬封锁）——
+    #   那种响应会掉进下面的解析逻辑，最后报一个含糊的错，用户不知道该干嘛。
+    if is_cf_block(html):
+        out["error"] = (
+            "ayakamods 把这个请求挡在了门外（Cloudflare）—— 不是你的网络断了。\n"
+            "实测这种封锁连真实浏览器都可能过不去，通常是站点不接受当前"
+            "出口 IP 的自动请求。\n"
+            "可以试：① 换一个代理节点 / 关掉代理再试；② 过一会儿再试；"
+            "③ 直接到浏览器打开这个页面看版本，再用「指定来源…」手工填。")
         return out
     if re.search(r"page cannot be found|This mod.*can'?t be found", html, re.I):
         out["error"] = "该页面不存在（mod 可能被删除或改名）"
@@ -869,7 +969,10 @@ def ayaka_list_page(page: int = 1) -> list[dict]:
         html = http_get(url, accept="text/html")
     except NetError:
         return []
-    if re.search(r"Just a moment|checking your browser", html, re.I):
+    # ★ 硬封锁也要当成"这页没抓到"：以前只认 "Just a moment"，
+    #   而 "you have been blocked" 的封锁页里**没有** modCardLink，
+    #   于是返回空列表 → 上层把索引重建"成功"成 0 条，看起来像站点没模组。
+    if is_cf_block(html):
         return []
 
     items: list[dict] = []

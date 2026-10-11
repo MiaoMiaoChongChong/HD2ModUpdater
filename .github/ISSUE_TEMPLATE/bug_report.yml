@@ -1,0 +1,68 @@
+name: 问题反馈（出错了 / 用不了）
+description: 工具报错、模组搜不到、下载或部署失败、界面异常等
+title: "[反馈] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        先谢谢你愿意反馈 —— 请务必把「诊断信息」带上，
+        没有它我只能靠猜（不知道你的工具版本、装了什么模组、走到哪一步失败）。
+
+        **怎么拿诊断信息**（10 秒）：
+        1. 打开工具 → 左侧「反馈 / 帮助」
+        2. 点「生成反馈信息…」
+        3. 写一句现象 → 点「复制完整诊断」
+        4. 回到这里，粘到下面的「诊断信息」框里
+
+        从**报错弹窗**上点「生成反馈信息…」也可以，那样会自动带上日志。
+        复制到的内容里**不包含**你的 N网 key 和 GitHub token。
+
+  - type: textarea
+    id: diag
+    attributes:
+      label: 诊断信息（必填）
+      description: 点工具里的「复制完整诊断」，然后粘在这里。
+      placeholder: |
+        ============================================================
+        HD2 Mod Updater 诊断信息（v...）
+        ...
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: 你看到的现象
+      description: 一句话说清就行。有截图的话可以直接贴在下面。
+      placeholder: 例如：有 3 个模组一直显示「未找到来源」，但它们明明在 GitHub 上有仓库。
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 你是怎么操作的
+      description: 点了哪些按钮、走到哪一步出的问题（不知道怎么写就跳过）。
+      placeholder: 例如：点「检查更新」→ 等它跑完 → 那 3 行显示「未找到来源」。
+    validations:
+      required: false
+
+  - type: textarea
+    id: expect
+    attributes:
+      label: 你期望的结果
+      placeholder: 例如：希望能自动认出来，或者至少告诉我为什么认不出来。
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认一下
+      options:
+        - label: 诊断信息里没有我的私人信息（工具会自动抹掉 key/token，用户名也会打码）
+          required: false
+        - label: 我已经把 HD2 Arsenal 完全关闭了（涉及部署/导入的问题才需要）
+          required: false

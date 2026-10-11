@@ -21,11 +21,30 @@ STEPS = [
     ("负向验证：检查脚本本身能抓到问题", ["tests/test_checker_negative.py"]),
     ("离线测试：两个修复（中文来源 / 撤销来源）", ["tests/test_fixes.py"]),
     ("离线+界面测试：部署状态读取与「检查已部署的」", ["tests/test_deploy_status.py"]),
+    ("离线测试：部署到游戏（纯复制 + 编号方向）", ["tests/test_deploy.py"]),
+    ("离线测试：与 Arsenal 同步（镜像接管 / 写回 / 冲突检测）", ["tests/test_arsenal_sync.py"]),
+    ("离线测试：拖入压缩包加入模组库", ["tests/test_modimport.py"]),
+    ("离线测试：来源候选与“需用户确认”", ["tests/test_choice.py"]),
+    ("离线测试：下载页（下载 → 导入）", ["tests/test_downloads.py"]),
+    ("离线测试：备份轮转与「备份」页", ["tests/test_backups.py"]),
+    ("离线测试：无 Arsenal 环境的行为", ["tests/test_no_arsenal.py"]),
+    ("界面测试：部署页与勾选", ["tests/test_deploy_dialog.py"]),
     ("界面测试：撤销来源并重新识别", ["tests/test_gui_undo.py"]),
+    ("离线+界面测试：反馈 / 诊断（日志、脱敏、报告、入口）", ["tests/test_diag.py"]),
+    ("离线+界面测试：设置页可滚动 + 站点拦截的说明与出路",
+     ["tests/test_settings_scroll.py"]),
 ]
 
 env = dict(os.environ)
 env["PYTHONIOENCODING"] = "utf-8"
+# ★ 护栏：禁止测试写到**真实的** Arsenal 库（只允许写临时目录）。
+#   本项目曾有一次 ad-hoc 脚本没打桩就跑在真实库上，把用户模组库改了顺序;
+#   靠结构性护栏比靠"记得打桩"可靠。
+env["HD2U_READONLY_GUARD"] = "1"
+# ★ 报错弹窗现在是自定义的模态窗口（比 messagebox 多「生成反馈信息」出口）。
+#   测试里不能让它弹出来等人点关闭 —— 设了这个开关后，error_box 退回普通
+#   messagebox（各测试早就把它打桩了），行为与加这个功能之前完全一致。
+env["HD2U_NO_DIALOG"] = "1"
 
 failed = []
 for title, args in STEPS:

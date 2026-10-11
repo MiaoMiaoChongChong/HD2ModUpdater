@@ -27,6 +27,13 @@ from .util import app_data_dir
 # 用户要求的站点优先级
 PROVIDER_PRIORITY = {"github": 0, "nexus": 1, "ayaka": 2}
 
+# ---- N 网"按名字搜"的门槛（用户拍板：只有确实搞不清楚才打扰用户）----
+# 「说得通」= 算得上一个像样的候选；有 ≥2 个这样的就要请用户来选。
+PLAUSIBLE_SCORE = 0.62
+# 「对得很严」= 只有一个候选时可以放心采纳（实测：Improved Railgun Sights 这类
+# 站上名字与本地完全同名，搜到的唯一候选就是它）。
+STRICT_SCORE = 0.90
+
 # 名字里这些词对搜索没用，去掉能显著提高命中率
 STOPWORDS = {
     "v", "version", "mod", "hd2", "helldivers", "helldivers2", "update",
@@ -149,16 +156,16 @@ def search_terms(entry: dict) -> list[str]:
             continue
         b = base
         b = re.sub(r"_AR\d+.*$", "", b)                        # Arsenal 后缀
-        b = re.sub(r"\s+\d{3,7}\s+\d+(?:\.\d+)*\s+\d{4}-\d{2}-\d{2}T\S*", "", b)
+        # N 网完整命名的尾巴：`<编号> <版本> <日期>T<时间>Z <随机slug>`
+        # ★ slug（形如 vcLNeByhN / IzUPRha2W）**必须绑在这条尾巴里一起剥**，
+        #   不能单独按"7~12 位、含大小写"去猜 —— 实测踩过：那个启发式会把
+        #   正常的**英文单词**也删掉，`Resupply Boxes Emissive` 被削成
+        #   `Resupply Boxes`（"Emissive" 正好 8 位、首字母大写），
+        #   于是搜索词残缺、三个站点全都搜不到。这个 bug 拖累了 GitHub /
+        #   ayakamods / N 网 所有搜索路径。
+        b = re.sub(r"\s+\d{3,7}\s+\d+(?:\.\d+)*\s+\d{4}-\d{2}-\d{2}T\S*"
+                   r"(?:\s+[A-Za-z0-9]{7,12})?", "", b)
         b = re.sub(r"\s+[A-Za-z0-9]{7,}_AR.*$", "", b)
-        # Nexus 命名尾部那个随机 slug（形如 vcLNeByhN / IzUPRha2W / KHd6InFpy）
-        # 特征：长度 7~12、只有字母数字、且同时含大小写（自然词很少这样）
-        b = re.sub(r"\s+[A-Za-z0-9]{7,12}\s*$", lambda m: (
-            " " if (any(c.isupper() for c in m.group().strip())
-                    and any(c.islower() for c in m.group().strip())
-                    and len(m.group().strip()) >= 7)
-            else m.group()
-        ), b)
         b = re.sub(r"\[[^\]]*\]", " ", b)                      # 方括号说明
         b = re.sub(r"\([^)]*\)", " ", b)                       # 圆括号说明
         b = re.sub(r"（[^）]*）", " ", b)
@@ -175,6 +182,49 @@ def search_terms(entry: dict) -> list[str]:
         t = re.sub(r"\s+", " ", t).strip()
         if t and t.lower() not in {x.lower() for x in terms}:
             terms.append(t)
+
+    # 0) ★ 先放「紧凑词」（把空格去掉）—— 必须排在最前面。
+    #    两个实测原因（2026-10-11）：
+    #    ① **GitHub 搜索按词 AND 匹配**，多词组合经常直接 0 结果
+    #       （'DiversBestFriend R41 MissionBlacklist' → 0 个），
+    #       而仓库名往往是连写的（'HWG90/DiversBestFriend'）；
+    #    ② 搜索循环有 `tried >= 5` 的配额截断 —— 排在后面的词**根本不会被执行**。
+    #    实测：'DiversBestFriend' 命中目标，相似度 1.00、HD2 证据 1 → 可采纳。
+    #
+    #    ★ 但也不能乱塞：**单字词**（如 "Diver's"）会搜出一堆无关仓库、
+    #    白白占掉一个配额（实测它返回 10 个全不相干的结果）；
+    #    **超长连写**（如 "ResupplyBoxesEmissive" 21 字符）GitHub 搜不出东西，
+    #    同样白占配额。所以只收 4~20 字符、且不含撇号的紧凑词。
+    compact_terms: list[str] = []
+    for base in (dirname, label):
+        if not base:
+            continue
+        b = re.sub(r"_AR\d+.*$", "", base)
+        b = re.sub(r"\s+\d{3,7}\s+\d+(?:\.\d+)*\s+\d{4}-\d{2}-\d{2}T\S*"
+                   r"(?:\s+[A-Za-z0-9]{7,12})?", "", b)
+        b = re.sub(r"[_\-]+", " ", b)
+        b = re.sub(r"\([^)]*\)|（[^）]*）|\[[^\]]*\]", " ", b)
+        # ★ 版本号要连**大写 R 开头**的（R41 / r41 / r35 是这类 mod 的常见版本形
+        #   式）；只剥 v/V 会留下 "R41"，紧凑词就变成 "DiversBestFriendR41…"，
+        #   GitHub 搜不出东西（实测踩过）。
+        b = re.sub(r"\b[RrVv]?\d+(\.\d+)*\b", " ", b)
+        words = [w for w in b.split() if w and w.lower() != "hd2"]
+        if len(words) >= 2:
+            comp = "".join(words)
+            if 4 <= len(comp) <= 20:
+                compact_terms.append(comp)
+    # 目录名**不含空格**时（形如 `DiversBestFriend-R41-MissionBlacklist`），
+    # 首个 `-`/`_` 分段通常就是仓库名形态 —— 单独也试一次。
+    # ★ 为什么要挑"不含空格"：目录名带空格的多半是"英文短语标题"
+    #   （如 `Resupply Boxes Emissive`），首词（"Resupply"）会搜出一堆无关仓库、
+    #   白占一个配额（实测 10 个全不相干）。这样能精确命中而不添噪。
+    d0 = re.sub(r"_AR\d+.*$", "", dirname).strip()
+    if d0 and " " not in d0:
+        seg = re.split(r"[_\-]", d0)[0]
+        if len(seg) >= 5 and re.fullmatch(r"[A-Za-z0-9]+", seg):
+            compact_terms.append(seg)
+    for c in compact_terms:
+        push(c)
 
     # 1) 完整干净名
     for r in raw:
@@ -306,6 +356,31 @@ def index_status_text() -> str:
     return f"{days} 天前更新（每 {INDEX_TTL_DAYS} 天自动更新）"
 
 
+def _why_crawl_empty() -> str:
+    """一条都没抓到时说清原因（给界面/命令行看的）。
+
+    现场再打一枪列表页，区分两种完全不同的情况 —— 给用户的建议也不一样：
+      · Cloudflare 封锁/挑战页 → 站点不接受本机出口的自动请求（换节点/等待）
+      · 超时、连不上           → 本机网络/代理问题
+    """
+    url = f"{providers.AYAKA_BASE}/mods/games/helldivers-2.119/"
+    try:
+        html = providers.http_get(url, accept="text/html", retries=1, timeout=12)
+    except Exception as e:  # noqa: BLE001
+        return ("没能从 ayakamods 抓到任何模组："
+                + providers.friendly_error(str(e))
+                + "\n（原索引已保留，不受影响。）")
+    if providers.is_cf_block(html):
+        return ("没能从 ayakamods 抓到任何模组：站点把这次请求挡在了门外"
+                "（Cloudflare）。\n"
+                "这不是你本机网络断了 —— 实测这种封锁连真实浏览器都可能过不去。\n"
+                "可以试：① 换一个代理节点 / 关掉代理再试；② 过一会儿再试。\n"
+                "（原索引已保留，不受影响；已有的来源识别结果也还能用。）")
+    if not html.strip():
+        return "没能从 ayakamods 抓到任何模组：列表页返回了空内容。（原索引已保留。）"
+    return ("没能从 ayakamods 抓到任何模组：页面结构可能变了（原索引已保留）。")
+
+
 def rebuild_index(progress=None) -> list[dict]:
     """重新爬 ayakamods 列表建索引。
 
@@ -333,6 +408,12 @@ def rebuild_index(progress=None) -> list[dict]:
         # index_is_stale() 会认为它很新鲜、锁死 7 天，用户在这 7 天里
         # 一直在用一个残缺索引去识别来源（表现为"很多 mod 突然认不出来了"）。
         if not items:
+            # ★ 必须说出**为什么**没抓到：用户点了「重建站点索引」，结果
+            #   只看到"完成：0 个模组"或者干脆没变化，会以为是自己哪里点错了。
+            #   实测（2026-10-11）：站点对当前出口 IP 返回 Cloudflare 封锁页，
+            #   抓取必然为空 —— 这时要明确指向"换个网络/代理节点再试"。
+            if progress:
+                progress(_why_crawl_empty())
             return before
         if before and len(items) < len(before) * 0.8:
             if progress:
@@ -559,9 +640,20 @@ def candidates_for(
     github_token: str = "",
     use_github_search: bool = True,
     ayaka_index: list[dict] | None = None,
+    nexus_api_key: str = "",
     log=None,
+    only_providers: set[str] | None = None,
 ) -> list[dict]:
-    """为一个 mod 收集所有可能的来源候选，按用户优先级排序。"""
+    """为一个 mod 收集所有可能的来源候选，按用户优先级排序。
+
+    ``only_providers`` 非空时**只跑这几个站点的识别路**（其余一律跳过）——
+    给「来源总览」里"只重新查找这一个站点"用（用户 2026-10-11 提的：
+    「可以单独查找某一个来源或者全部重新查找」）。
+    只查一个站点时能省掉另外两站的网络请求，也避免把用户手工指定的来源覆盖掉。
+    """
+
+    def want(prov: str) -> bool:
+        return only_providers is None or prov in only_providers
 
     def say(msg: str) -> None:
         if log:
@@ -593,6 +685,8 @@ def candidates_for(
         prov = "ayaka" if prov in ("ayakamods", "ayaka") else prov
         if prov not in ("github", "nexus", "ayaka"):
             continue
+        if not want(prov):
+            continue
         url = src.get("url") or ""
         if not url:
             if prov == "nexus" and src.get("id"):
@@ -605,7 +699,7 @@ def candidates_for(
         say(f"manifest 里找到 {prov} 来源")
 
     # --- 2) Arsenal 库里的 nexusData ---
-    if entry.get("nexus_mod_id"):
+    if entry.get("nexus_mod_id") and want("nexus"):
         add(
             "nexus",
             entry["nexus_mod_id"],
@@ -618,7 +712,7 @@ def candidates_for(
     # --- 3) 目录名里的 N 网编号 ---
     d = entry.get("dirname") or ""
     m = re.search(r"\s(\d{3,7})\s+\d+(?:\.\d+)*\s+\d{4}-\d{2}-\d{2}T", d)
-    if m and m.group(1) != entry.get("nexus_mod_id"):
+    if m and m.group(1) != entry.get("nexus_mod_id") and want("nexus"):
         add(
             "nexus",
             m.group(1),
@@ -629,7 +723,7 @@ def candidates_for(
         say(f"目录名里读N网编号 #{m.group(1)}")
 
     # --- 4) GitHub 搜索 ---
-    if use_github_search:
+    if use_github_search and want("github"):
         terms = search_terms(entry)
         tried = 0
         for term in terms:
@@ -685,7 +779,7 @@ def candidates_for(
             break
 
     # --- 5) ayakamods 本地索引 ---
-    if ayaka_index:
+    if ayaka_index and want("ayaka"):
         for term in search_terms(entry)[:3]:
             hits = search_ayaka_index(term, ayaka_index, top=5)
             if not hits:
@@ -739,6 +833,43 @@ def candidates_for(
                 + ("，版本号一致" if top.get("verified") else "") + "）")
             break
 
+    # --- 6) N 网「按名字搜」（REST v1 没有搜索端点，走 GraphQL v2）---
+    # 为什么需要它：N 网 mod 编号只存在于 N 网自己的下载命名里；从网盘/整合包
+    # 导入的 mod 本地一点线索都没有（manifest 无 Sources、Arsenal 无 nexusData、
+    # 目录名也改过），五条老路全够不到，只能按名字去站上找。
+    #
+    # 只在**前面没有确定的答案**时才跑：既省请求，也避免"已经确定了还冒出候选
+    # 来打扰用户"（用户明确要求：不能每个都问）。
+    if nexus_api_key and not any(c.get("confidence") == "high" for c in found):
+        for term in search_terms(entry)[:2]:
+            hits = providers.nexus_search(term, nexus_api_key)
+            if not hits:
+                continue
+            scored: list[tuple[float, dict]] = []
+            for h in hits:
+                sc, extra = site_name_score(entry, h.get("name", ""))
+                if len(extra) >= 2:
+                    # 站上名多出太多实词 = 另一个 mod（实测：Megapack 的中文汉化版）
+                    say(f"N 网搜到「{h.get('name')}」但多出 {sorted(extra)}，判为不同 mod")
+                    continue
+                if sc >= PLAUSIBLE_SCORE:
+                    scored.append((sc, h))
+            if not scored:
+                continue
+            scored.sort(key=lambda t: -t[0])
+            for sc, h in scored[:5]:
+                # 只有一个候选且对得很严 → 可以放心采纳；否则交给用户判断
+                conf = "high" if (len(scored) == 1 and sc >= STRICT_SCORE) else "medium"
+                add("nexus", h["mod_id"],
+                    f"https://www.nexusmods.com/helldivers2/mods/{h['mod_id']}",
+                    f"N 网按名字搜「{term}」命中（站上叫「{h['name']}」，"
+                    f"名字相似度 {sc:.0%}）",
+                    conf, score=sc, site_name=h.get("name", ""),
+                    alternatives=[x[1].get("name", "") for x in scored if x[1] is not h][:3])
+            say(f"N 网按名字搜「{term}」得到 {len(scored)} 个候选"
+                + ("（要请用户确认）" if len(scored) >= 2 else ""))
+            break
+
     # 按用户要求的优先级排序：GitHub > Nexus > ayakamods
     # 同站点内高可信度优先
     found.sort(
@@ -748,6 +879,67 @@ def candidates_for(
         )
     )
     return found
+
+
+def strip_annotations(name: str) -> str:
+    """去掉名字里的**括号类注释**（`(LUT edit)` / `（外挂）` / `[test]` / `【…】`）。
+
+    为什么要单独剥掉：括号里通常是**说明性文字**，不是区分不同 mod 的实词。
+    实测踩过 —— 站上名 `Resupply Boxes Emissive (LUT edit)` 与本地名
+    `Resupply Boxes Emissive` 本来是同一个 mod，但 `(LUT edit)` 会被算成
+    "多出 2 个实词"，被既有防呆判成"另一个 mod"而误杀。
+    剥掉注释后它就能正确命中；而真正的不同 mod（如 Megapack 的
+    `Chinese localization`，没有括号）仍会被多实词判据拦住。
+    """
+    n = name or ""
+    for pat in (r"\([^)]*\)", r"（[^）]*）", r"\[[^\]]*\]", r"【[^】]*】"):
+        n = re.sub(pat, " ", n)
+    return re.sub(r"\s+", " ", n).strip()
+
+
+def site_name_score(entry: dict, site_name: str) -> tuple[float, set]:
+    """本地名字 vs 站上名字：返回（相似度, 站上多出来的实词集合）。
+
+    多出来的实词很关键 —— 复用本项目既有的防呆判据：
+    **站上名字比本地名字多出太多实词时，那是"另一个 mod"**。
+    实测踩过：搜 "Vanilla Plus Megapack" 第一位返回的是它的**中文汉化版**
+    （多出 chinese / localization），真身排第二。
+
+    比对前两边都先剥掉括号注释（见 :func:`strip_annotations`）。
+    """
+    local = strip_annotations(entry.get("label") or "") \
+        or strip_annotations(entry.get("dirname") or "")
+    site = strip_annotations(site_name or "")
+    if not local or not site:
+        return 0.0, set()
+    ln, sn = normalize(local), normalize(site)
+    if not ln or not sn:
+        return 0.0, set()
+    score = similarity(ln, sn)
+    extra = {w for w in (set(sn.split()) - set(ln.split()))
+             if w not in STOPWORDS and len(w) > 2}
+    return score, extra
+
+
+def ambiguous_reason(cands: list[dict]) -> str:
+    """这批候选是不是"确实搞不清楚、需要用户来选"？返回原因，'' = 不需要。
+
+    ★ 用户定的规则（2026-10-11）：**只有两种情况才允许打扰用户** ——
+      ① 有 ≥2 个候选"都说得通"（同名/难分）；
+      ② 有多个变体/文件、分不清该跟哪个（这条在下载阶段判定）。
+    **其余一律不打扰**：
+      · 已经有确定答案（high）→ 不用问；
+      · 完全没候选 → 归到"没找到来源"，也不逐条弹窗；
+      · 只有一个候选但名字对不严 → **既不采纳也不问**（用户明确不要这种打扰）。
+    """
+    if not cands:
+        return ""
+    if any(c.get("confidence") == "high" for c in cands):
+        return ""
+    goods = [c for c in cands if float(c.get("score") or 0) >= PLAUSIBLE_SCORE]
+    if len(goods) >= 2:
+        return "有多个候选都说得通"
+    return ""
 
 
 def best_source(cands: list[dict]) -> dict | None:

@@ -156,6 +156,49 @@ def check_one_source(src: dict, api_key: str, github_token: str,
     return out
 
 
+def check_one_source_all(src: dict, api_key: str, github_token: str,
+                         variant: str = "") -> list[dict]:
+    """查一个来源，返回**全部**结果（可能多于一条）。
+
+    ★ 为什么要多返回一条（2026-10-11 用户质疑后定的）：
+    GitHub 仓库常常同时挂着「正式版 r41」和「更新的测试版 r42」。以前只报
+    正式版，于是"只有测试版可更"这一档里 GitHub 永远缺席 —— 用户看到的是
+    "只有 a 站有测试版更新"，而他知道 GitHub 上也有那个测试版，就会以为
+    「GitHub 的 pre-release 没被识别」。
+    现在：正式版仍走主结果；若仓库里还有一个**更新的预发布版**，就补一条
+    标着 prerelease 的结果，让它在 beta 档里正常参与比较与展示。
+    """
+    out = check_one_source(src, api_key, github_token, variant)
+    if not isinstance(out, dict):
+        return [out]
+    extra: list[dict] = []
+    pre = out.get("prerelease_latest")
+    if out.get("ok") and pre:
+        # 只有"预发布版比正式版更新"时才补 —— 否则是冗余候选
+        try:
+            newer = compare(str(out.get("version") or ""),
+                            str(pre.get("version") or "")) == "newer"
+        except Exception:  # noqa: BLE001
+            newer = False
+        if newer:
+            assets = pre.get("assets") or []
+            pick = assets[0] if assets else {}
+            e = providers._empty(out.get("provider") or "github")
+            e.update({
+                "ok": True,
+                "version": str(pre.get("version") or ""),
+                "prerelease": True,
+                "url": str(pre.get("url") or out.get("url") or ""),
+                "release_url": str(pre.get("url") or ""),
+                "updated": str(pre.get("published") or ""),
+                "asset_name": str(pick.get("name") or ""),
+                "download_url": str(pick.get("url") or ""),
+                "how": "GitHub 上的预发布版（作者标了 pre-release）",
+            })
+            extra.append(e)
+    return [out] + extra
+
+
 def evaluate(entry: dict, checks: list[dict]) -> dict:
     """把多个来源的查询结果汇总成一个结论。"""
     installed = entry.get("installed_version") or ""
@@ -260,10 +303,38 @@ class Engine:
         self._cancel = threading.Event()
         self.library: list[dict] = []
         self.resolved: dict[str, list[dict]] = {}   # key -> 来源候选
+        # 「来源总览」重查统计：key -> {cands, trusted, total}
+        # 用途：候选找到了但可信度不够、没被采用时，界面要如实说出来
+        # （否则用户点完"只查这个"只看到"没找到"，会以为按钮没生效）。
+        self.refind_stats: dict[str, dict] = {}
+        # 需要用户来选的（"确实搞不清楚"的那些）：key -> {label, reason, candidates}
+        self.ambiguous: dict[str, dict] = {}
         self.results: list[dict] = []
 
     def cancel(self) -> None:
         self._cancel.set()
+
+    def accept_choice(self, key: str, cand: dict) -> bool:
+        """采纳用户从候选里选定的来源 —— **立刻落盘**（受保护记录）。
+
+        ★ 用户明确要求：「每选完一个都要记住，别选一半还有一半没选，
+        用户关了就连前面的信息也丢了」→ 所以这里**逐个立刻写盘**，
+        绝不攒到最后一起存。
+        """
+        if not key or not cand:
+            return False
+        entry = next((e for e in self.library if source_key(e) == key), None)
+        if entry is None:
+            return False
+        set_manual_source(entry, cand)
+        keep = {k: v for k, v in cand.items()
+                if k in ("provider", "id", "url", "asset")}
+        keep["confidence"] = "high"
+        self.resolved[key] = [keep]
+        self.ambiguous.pop(key, None)
+        self._log(f"已按你的选择记住来源：{cand.get('provider')} "
+                  f"{cand.get('id') or cand.get('url')}")
+        return True
 
     @property
     def cancelled(self) -> bool:
@@ -277,17 +348,23 @@ class Engine:
 
     # ------------------------------------------------------- 解析来源
     def resolve_sources(self, force_search: bool = False,
-                        only_keys: set[str] | None = None) -> None:
+                        only_keys: set[str] | None = None,
+                        only_providers: set[str] | None = None) -> None:
         """给每个 mod 找出来源。已手工确认过的优先用。
 
         站点索引过期（默认 7 天）会**自动重建**，不需要用户手动点。
 
         ``only_keys`` 非空时只解析这些模组 —— 用于「撤销来源并重新识别」
         这种单条操作，免得为一个模组把全库重跑一遍。
+
+        ``only_providers`` 非空时**只查这几个站点**（给「来源总览」里
+        "单独查找某一个来源"用）。★ 这种情况下**不能被"已保存的来源"短路** ——
+        用户点"只查 GitHub"的意思就是"再去找一遍 GitHub"，
+        如果因为盘上已有 a 站来源就直接跳过，这个按钮就白点了。
         """
         saved = load_sources()
         index: list[dict] = []
-        if self.use_search:
+        if self.use_search and (only_providers is None or "ayaka" in only_providers):
             # ensure_index 内部会判断：不存在、或超过保鲜期 → 自动重建。
             # （旧代码把「过期检查」写在了「索引不存在」的分支里，是死代码，
             #   导致索引建好后再也不更新。）
@@ -304,8 +381,11 @@ class Engine:
         # GitHub 搜索并发预填：只有「真要联网搜」的模组才需要 ——
         # 盘上已有来源（手工或此前自动识别的）在下面的循环里会直接采纳、
         # 根本不会走到 GitHub 那一步，提前为它们搜索纯属白烧配额。
-        if self.use_search and not self.cancelled:
-            need = [e for e in todo if not saved.get(source_key(e))]
+        do_search = self.use_search and (only_providers is None
+                                        or "github" in only_providers)
+        if do_search and not self.cancelled:
+            need = [e for e in todo if only_providers is not None
+                    or not saved.get(source_key(e))]
             if need:
                 try:
                     matcher.batch_prefetch_github(
@@ -322,29 +402,114 @@ class Engine:
             key = source_key(entry)
             self._progress(i - 1, total, f"解析来源：{entry.get('label') or entry['dirname']}")
 
-            # 用户手工确认过的直接采纳
-            if key in saved and saved[key]:
+            # 用户手工确认过的直接采纳。
+            # ★ 但"只查某个站点"时必须跳过这个短路 —— 否则用户点
+            #   "只查 GitHub" 会因为它已有 a 站来源而什么都不做。
+            if only_providers is None and key in saved and saved[key]:
                 self.resolved[key] = saved[key]
                 continue
 
             cands = matcher.candidates_for(
                 entry,
                 github_token=self.github_token,
-                use_github_search=self.use_search,
+                use_github_search=do_search,
                 ayaka_index=index,
+                nexus_api_key=self.api_key,
                 log=lambda m, e=entry: self._log(f"[{e.get('label') or e['dirname']}] {m}"),
+                only_providers=only_providers,
             )
+            if only_providers is not None:
+                # 只查某个站点：把新找到的**合并**进原有来源（不覆盖别的站点）
+                self.resolved[key] = self._merge_sources(saved.get(key) or [], cands)
+                n = len(self.resolved[key])
+                # 记下"查到几个候选 / 采用了几个" —— 界面要靠它如实说明
+                # （候选可信度不够、没敢替你采用时，必须说清楚，不能只报"没找到"）。
+                self.refind_stats[key] = {
+                    "cands": len(cands),
+                    "trusted": len(self._trusted(cands)),
+                    "total": n,
+                }
+                self._log(f"{entry.get('label')}：{'、'.join(sorted(only_providers))} "
+                          f"查到 {len(cands)} 个候选，合并后共 {n} 个来源")
+                continue
             # 只自动采纳高可信度的；中低可信留给用户确认
             auto = [c for c in cands if c.get("confidence") == "high"]
             if auto:
                 self.resolved[key] = auto
                 self._log(f"自动识别：{entry.get('label')} -> {auto[0]['provider']}：{auto[0]['how']}")
+                continue
+            # 没有确定答案时：**只有"确实搞不清楚"才请用户来选**（用户拍板）。
+            # 其余情况一律不打扰 —— 尤其是"只有一个候选但名字对不严"，
+            # 按用户要求既不采纳也不问（归到"没找到来源"）。
+            reason = matcher.ambiguous_reason(cands)
+            if reason:
+                self.ambiguous[key] = {
+                    "label": entry.get("label") or entry.get("dirname") or "",
+                    "reason": reason,
+                    "candidates": cands,
+                }
+                self._log(f"需用户确认：{entry.get('label')}（{reason}，"
+                          f"{len(cands)} 个候选）")
             else:
-                self.resolved[key] = []
+                self._log(f"没能确定来源：{entry.get('label')}"
+                          + (f"（有 {len(cands)} 个候选但都不够确定，"
+                             "不打扰你）" if cands else ""))
+            self.resolved[key] = []
         # 增量模式只看了选中的那几条，分母要用实际处理的条数，
         # 否则会打出「2/20 个已识别」这种看着像失败的数字。
         n_done = sum(1 for e in todo if self.resolved.get(source_key(e)))
         self._log(f"来源解析完成：{n_done}/{total} 个已识别")
+
+    @staticmethod
+    def _merge_sources(old: list[dict], new: list[dict]) -> list[dict]:
+        """把新查到的来源合并进原有列表（给"只查某一个站点"用）。
+
+        规则（都是为了不破坏用户已有的东西）：
+          · 同一个站点**确实重新认出来了**时，替换它（用户点"只查 GitHub"
+            就是想让 GitHub 重新认）；
+          · ★ 但若这次对该站点只找到 medium/low 的候选（"名字像、不敢确定"），
+            就**保留原来的记录**，不要用一条可疑的结果换掉用户手上能用的那条 ——
+            宁可维持原状，也不要把来源弄丢。
+          · 其它站点的记录**原样保留**（绝不因为只查了一个站点就把别的站点删掉）；
+          · 手工指定的记录（manual）**保留其 manual 标记**，除非它属于这次重查的站点。
+
+        新候选的 ``confidence`` **保留**（不剥掉）：下游要靠它区分
+        "这次真的认出来了（high）"和"只是有个候选、可信度不够"。
+        """
+        trusted_new = Engine._trusted(new)
+        replaced = {str(c.get("provider") or "") for c in trusted_new}
+        out: list[dict] = []
+        for o in old:
+            prov = str(o.get("provider") or "")
+            if prov in replaced:
+                continue            # 这个站点被可信地重查了 → 用新结果
+            out.append(dict(o))
+        # 只把"可信的新候选"和"没被替换掉的那些站点"合起来。
+        # 不可信的新候选不入列表：它们既不能替换旧记录，也不该参与后续版本比较
+        # （否则会拿一个可疑匹配的版本号去判定"有更新"，把用户引到错的页面）。
+        for c in trusted_new:
+            out.append(dict(c))
+        return out
+
+    @staticmethod
+    def _trusted(cands: list[dict]) -> list[dict]:
+        """从候选里挑出**可以长期采用**的那些。
+
+        判据（与原 `persist_resolved` 的落盘规则一致，别放宽）：
+          · ``confidence == "high"`` —— 这次确实认出来了；
+          · **没有** ``confidence`` 字段 —— 这条来自磁盘上已有的记录
+            （`_merge_sources` 保留的其它站点条目），它本来就被信任。
+
+        medium / low 一律不算：它们正是"名字像但不敢确定"的那种，
+        落盘会固化成错误的"已确认来源"，下次直接拿它去比版本，
+        用户会被引到错误的 mod 页面上去（这是原有注释里写明的原因）。
+        """
+        out = []
+        for c in cands or []:
+            conf = c.get("confidence")
+            if conf is None or conf == "high":
+                out.append(c)
+        return out
 
     # ---------------------------------------------------------- 检查更新
     def check(self, only_keys: set[str] | None = None) -> list[dict]:
@@ -376,7 +541,7 @@ class Engine:
         done = 0
         with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
             futs = {
-                ex.submit(check_one_source, src, self.api_key, self.github_token,
+                ex.submit(check_one_source_all, src, self.api_key, self.github_token,
                           entry.get("variant") or ""): (entry, key, src)
                 for entry, key, src in jobs
             }
@@ -387,12 +552,14 @@ class Engine:
                     break
                 entry, key, src = futs[fut]
                 try:
-                    res = fut.result()
+                    got = fut.result()
                 except Exception as e:  # noqa: BLE001
-                    res = providers._empty(src.get("provider", "?"))
-                    res["error"] = f"意外错误：{e}"
-                res["_src"] = src
-                by_key.setdefault(key, []).append(res)
+                    got = providers._empty(src.get("provider", "?"))
+                    got["error"] = f"意外错误：{e}"
+                # check_one_source_all 可能返回多条（GitHub 正式版 + 更新的预发布版）
+                for res in (got if isinstance(got, list) else [got]):
+                    res["_src"] = src
+                    by_key.setdefault(key, []).append(res)
                 done += 1
                 self._progress(
                     done, total,
@@ -411,32 +578,57 @@ class Engine:
         return {"entry": entry, "checks": checks, **ev}
 
     # ------------------------------------------------------------- 保存
-    def persist_resolved(self) -> None:
+    def persist_resolved(self, refresh_keys: set[str] | None = None) -> None:
         """把自动识别结果写回来源表，下次直接用。
 
-        两道保护，确保**用户手工填写的来源永远不被覆盖**：
+        默认行为（两道保护，确保**用户手工填写的来源永远不被覆盖**）：
           1. 已存在的 key 一律跳过（无论手工还是自动）；
           2. 只保存高可信度的结果 —— 低可信（如索引里 56% 的噪声匹配）
              绝不落盘，否则会固化成错误的"已确认来源"，
              下次直接拿它去比版本，用户会被引到错误的 mod 页面上去。
+
+        ``refresh_keys`` 是**用户刚刚在「来源总览」里显式重查过**的那些 key。
+        对它们必须**照写不误** —— 否则用户点了"只查 GitHub"、界面里也提示
+        "查到 1 个候选"，结果一落盘就被"已存在就跳过"挡掉，磁盘上还是原来那条
+        （用户 2026-10-12 报的正是这个：「重新查找只是显示已经重新查找，结果
+        是什么也没显示，明明 GitHub 有这个模组也还是没找到」）。
+
+        注意 ``self.resolved[key]`` 在重查路径下已经是 `_merge_sources` 的产物：
+        被重查的站点用新结果、别的站点原样保留（含 manual 标记）。
+        但**新候选里 medium/low 的仍然不能落盘** —— 所以这里过一遍
+        `_trusted()`，只写"确实认出来的"和"盘上本来就有的"。
         """
         saved = load_sources()
+        refresh = refresh_keys or set()
         added = 0
         for key, cands in self.resolved.items():
-            if not cands or key in saved:
+            explicit = key in refresh
+            if not cands:
                 continue
+            if key in saved and not explicit:
+                continue
+            if explicit:
+                # 重查路径：`self.resolved[key]` 是 `_merge_sources` 的产物 ——
+                # "可信的新候选 + 原样保留的旧记录（含 manual）"。
+                # ★ 这里**再过一遍 `_trusted()`**：红线要钉在"写盘"这个边界上，
+                #   而不是只靠上游记得过滤（上游哪天多一条路径就漏了）。
+                picked = self._trusted(cands)
+            else:
+                picked = [c for c in cands if c.get("confidence") == "high"]
             keep = [
-                {k: v for k, v in c.items() if k in ("provider", "id", "url", "asset")}
-                for c in cands
-                if c.get("confidence") == "high"
+                {k: v for k, v in c.items()
+                 if k in ("provider", "id", "url", "asset", "manual")}
+                for c in picked
             ]
             if not keep:
+                # 显式重查但一个可信的都没认出来（比如只搜到个 medium）——
+                # **保留原来那条**，别把用户手上的来源清掉。
                 continue
             saved[key] = keep
             added += 1
         if added:
             save_sources(saved)
-            self._log(f"已保存 {added} 个自动识别的来源（只存高可信的）")
+            self._log(f"已保存 {added} 个来源")
 
 
 def summarize(results: list[dict]) -> dict:

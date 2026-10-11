@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 先看「遇到问题怎么办」（README）
+    url: https://github.com/MiaoMiaoChongChong/HD2ModUpdater/blob/main/README.md
+    about: 大部分问题（模组搜不到、查不到更新、部署没生效）这里都有自查步骤。
+  - name: 没有 GitHub 账号 / 打不开 GitHub
+    url: https://github.com/MiaoMiaoChongChong/HD2ModUpdater
+    about: 工具里点「反馈 / 帮助」→「复制短摘要」，把那段发到小黑盒/贴吧/群里也可以。

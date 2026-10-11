@@ -32,9 +32,20 @@ HIDDEN = [
     "hd2_updater.providers",
     "hd2_updater.matcher",
     "hd2_updater.arsenal",
+    "hd2_updater.arsenal_sync",
+    "hd2_updater.deploy",
+    "hd2_updater.modimport",
     "hd2_updater.records",
+    "hd2_updater.backups",
+    "hd2_updater.diag",
     "hd2_updater.util",
 ]
+
+# 需要把数据文件一起打进去的包。
+# tkinterdnd2 自带各平台的 tkdnd 二进制（Tcl 扩展），**不 collect 的话
+# 打包出来就没有拖放能力**（程序仍能跑，会安静降级成"点按钮选文件"）。
+# 实测：--collect-all tkinterdnd2 后，单文件 EXE 里 tkdnd 2.10.3 能正常加载。
+COLLECT_ALL = ["tkinterdnd2"]
 
 # 明确用不到、可排除以缩小体积的第三方库
 EXCLUDE = [
@@ -72,6 +83,9 @@ def main() -> int:
         cmd.append(f"--hidden-import={m}")
     for m in EXCLUDE:
         cmd.append(f"--exclude-module={m}")
+    # tkinterdnd2 带平台相关的 tkdnd 二进制，必须整体收集（缺了就没有拖放）
+    for m in COLLECT_ALL:
+        cmd.append(f"--collect-all={m}")
     # 需要动态 import 的模块（tkinter 的消息框、文件对话框）
     for m in ("tkinter", "tkinter.ttk", "tkinter.messagebox",
               "tkinter.filedialog", "tkinter.font"):

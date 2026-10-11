@@ -102,6 +102,24 @@ def write_config(patch: dict) -> None:
         pass
 
 
+def first_mod_priority(data_file: str) -> bool:
+    """Arsenal 的「第一个模组优先」设置（``setTopPriority``）。
+
+    影响部署时的编号方向：
+    - ``False``（Arsenal 默认）：列表越靠后优先级越高 —— 实测位次 0→patch_0、
+      位次 17→patch_44，且 Bingus loader 的 README 写明「默认设置下放最后 = 赢」。
+    - ``True``：反过来，列表第一个优先（README 对应说法是「把 loader 放最前」）。
+
+    读不到或结构异常时返回 False（Arsenal 默认值），绝不抛异常。
+    """
+    try:
+        with open(data_file, encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(data.get("setTopPriority"))
+
+
 def find_data_file(explicit: str | None = None) -> tuple[str | None, str]:
     """找 Arsenal 数据文件。
 
@@ -215,6 +233,8 @@ def load_library(data_file: str) -> list[dict]:
             "deploy_changed": bool(dstate.get("changed")),
             "deploy_order": dstate.get("order"),
             "in_profile": bool(dstate),
+            # 选项配置：部署时要用它过滤掉用户禁用的选项（include 名 = 子目录名）
+            "options": m.get("options") or [],
         }
         auto = (
             entry["nexus_version"]

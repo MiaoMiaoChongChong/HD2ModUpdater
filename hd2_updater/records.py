@@ -57,7 +57,10 @@ def save(data: dict) -> None:
 
 def mark(key: str, version: str, file_path: str,
          provider: str = "", label: str = "") -> None:
-    """记一笔「这个模组的这个版本已经下过」。"""
+    """记一笔「这个模组的这个版本已经下过」。
+
+    新下载会把 ``applied_at`` 清空 —— 换了新文件，上次"已导入"的结论不再适用。
+    """
     if not key:
         return
     data = load()
@@ -67,8 +70,56 @@ def mark(key: str, version: str, file_path: str,
         "at": now_str(),
         "provider": str(provider or ""),
         "label": str(label or ""),
+        "applied_at": "",
     }
     save(data)
+
+
+def mark_applied(key: str) -> None:
+    """把这个下载记成「已经导入过了」。
+
+    为什么必须记：ZIP 导入完**文件还在原地**，光看"文件在不在"永远分不清
+    这个下载到底应用了没有 —— 用户会看到「已下载」一直挂着，以为刚才那一下
+    没成功。记一笔就能把「待导入」和「已导入」分开。
+    """
+    if not key:
+        return
+    data = load()
+    rec = data.get(key)
+    if not isinstance(rec, dict):
+        return
+    rec["applied_at"] = now_str()
+    data[key] = rec
+    save(data)
+
+
+def applied(key: str) -> bool:
+    """这个下载是不是已经导入过了。"""
+    rec = get(key)
+    return bool(rec and str(rec.get("applied_at") or "").strip())
+
+
+def state(key: str) -> str:
+    """给「下载」页用的三态：``pending`` / ``applied`` / ``missing``。
+
+    · ``missing`` —— 文件已不在原处（被移走/删掉），别继续装作能用
+    · ``applied`` —— 已经导入过
+    · ``pending`` —— 文件在、还没导入，这是**要用户处理**的那些
+    """
+    rec = get(key)
+    if not rec:
+        return ""
+    fp = str(rec.get("file") or "")
+    if not fp or not os.path.isfile(fp):
+        return "missing"
+    return "applied" if str(rec.get("applied_at") or "").strip() else "pending"
+
+
+def all_records() -> list[tuple[str, dict]]:
+    """全部下载记录（给「下载」页列出来）。新的排前面。"""
+    items = [(k, v) for k, v in load().items() if isinstance(v, dict)]
+    items.sort(key=lambda kv: str(kv[1].get("at") or ""), reverse=True)
+    return items
 
 
 def get(key: str) -> dict | None:
@@ -85,17 +136,21 @@ def forget(key: str) -> None:
 
 
 def match(key: str, version: str) -> dict | None:
-    """只有当「记的版本 == 现在线上这个版本」**且文件还在**时才算已下载。
+    """只有当「记的版本 == 现在线上这个版本」**且文件还在、且还没导入过**时才算已下载。
 
     - 版本对不上（线上又更新了）→ 返回 None，界面继续显示「有更新」，正确。
     - 文件被移走/删掉 → 返回 None —— 用户多半已经导入 Arsenal 了，
       不该继续挂着「已下载」骗人。
+    - **已经导入过了 → 也返回 None**：这时的状态应该是按装好的版本去比
+      （通常是「已最新」），而不是继续显示「已下载」让用户以为还没处理。
     """
     ver = str(version or "").strip()
     if not key or not ver:
         return None
     rec = get(key)
     if not rec:
+        return None
+    if str(rec.get("applied_at") or "").strip():
         return None
     if str(rec.get("version") or "").strip() != ver:
         return None

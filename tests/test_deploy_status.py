@@ -128,7 +128,7 @@ if _can_gui:
           G.App._deploy_cell({"deployed": False, "in_profile": False, "enabled": False})
           == ("—未部署", "dep_no"))
 
-    print("\n【界面】表格有「部署」列且渲染正确")
+    print("\n【界面】更新检查页不再带部署列（已搬到部署页）")
     app = G.App()
     app.cancel_startup_detect()
     app.data_file = LIB_PATH
@@ -136,41 +136,26 @@ if _can_gui:
     app._populate()
     app.update()
     cols = app.tree["columns"]
-    check("列里有 deploy", "deploy" in cols, f"（{cols}）")
-    di = cols.index("deploy")
-    cellmap = {}
-    for iid in app.tree.get_children():
-        v = app.tree.item(iid, "values")
-        # 用 label 列定位模组
-        cellmap[v[cols.index("label")]] = v[di]
-    check("已部署的行显示「✓已部署」", cellmap.get("已部署的") == "✓已部署",
-          f"（{cellmap}）")
-    check("启用未部署的行显示「○未部署」", cellmap.get("启用未部署") == "○未部署",
-          f"（{cellmap}）")
-    check("配置档禁用的行显示「—未部署」", cellmap.get("配置档禁用") == "—未部署",
-          f"（{cellmap}）")
-    check("不在配置档的行显示「—未部署」", cellmap.get("不在配置档") == "—未部署",
-          f"（{cellmap}）")
+    check("更新检查页没有 deploy 列", "deploy" not in cols, f"（{cols}）")
+    check("更新检查页没有「部署选中」按钮", not hasattr(app, "btn_deploy"))
+    check("更新检查页没有「检查已部署更新」按钮", not hasattr(app, "btn_deployed"))
 
-    print("\n【界面】「检查已部署的」筛选与按钮")
+    print("\n【数据】「已部署」筛选仍然可用（更新检查要用它）")
     dk = app._deployed_keys()
     check("_deployed_keys 只含已部署那一个", dk == {"u-dep"}, f"（{dk}）")
     labels = [app.menu.entrycget(i, "label")
               for i in range(app.menu.index("end") + 1)
               if app.menu.type(i) == "command"]
-    check("右键菜单有「检查所有已部署的」",
-          any("检查所有已部署" in l for l in labels), f"（{labels}）")
-    check("操作栏有「检查已部署更新」按钮",
-          hasattr(app, "btn_deployed")
-          and app.btn_deployed.cget("text") == "检查已部署更新")
+    check("右键菜单不再有「检查所有已部署的」",
+          not any("检查所有已部署" in l for l in labels), f"（{labels}）")
 
-    # 拦截 _start_check，确认 _check_deployed 传的 only_keys 正确
+    # 只查已部署这条能力仍要能用（入口在部署页，但底层筛选不变）
     captured = {}
     orig = app._start_check
     app._start_check = lambda only_keys=None: captured.update(keys=only_keys)
     G.messagebox.showinfo = lambda *a, **k: None
-    app._check_deployed()
-    check("_check_deployed 只把已部署的 key 传下去",
+    app._check_deployed_keys({"u-dep"})
+    check("按已部署筛选的检查只传已部署的 key",
           captured.get("keys") == {"u-dep"}, f"（{captured}）")
     app._start_check = orig
     app.destroy()
