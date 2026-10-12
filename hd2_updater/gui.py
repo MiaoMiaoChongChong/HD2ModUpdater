@@ -16,7 +16,7 @@ import re
 import threading
 import tkinter as tk
 import traceback
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from . import APP_NAME, __version__, arsenal, matcher, providers, util
 from .arsenal import (
@@ -823,6 +823,8 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
         self.menu.add_command(label="指定来源…", command=self._ctx_set_source)
         self.menu.add_command(label="撤销来源并重新识别",
                              command=self._ctx_undo_source)
+        self.menu.add_command(label="本地版本…（查看 / 改 / 恢复自动）",
+                             command=self._ctx_local_version)
         self.menu.add_separator()
         self.menu.add_command(label="删除这个模组…", command=self._ctx_delete_mod)
         self.menu.add_separator()
@@ -1155,6 +1157,49 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
         )
 
     # ------------------------------------------------------- Arsenal 定位
+    def _prune_orphan_versions(self) -> int:
+        """清掉「手动填的本地版本」里已经不属于任何模组的孤儿记录。
+
+        什么时候会留下孤儿：模组被删除、重新导入后换了 uuid、或者用户换了
+        模组库位置。这些记录以前永远躺在 config.json 里 —— 用户早忘了填过，
+        模组也不在了，配置却还在变大。
+
+        只在**成功读到库**之后才清（读不到就一条都不动），免得把用户的数据
+        因为一次读取失败清空。
+        """
+        try:
+            n = arsenal.prune_version_overrides(
+                [e.get("uuid") for e in (self.library or []) if e.get("uuid")])
+        except Exception:  # noqa: BLE001
+            return 0
+        if n:
+            diag.event("清理", f"清掉 {n} 条已失效的手动版本记录"
+                                "（对应模组已不在库里）")
+        return n
+
+    def _heal_legacy_versions(self) -> int:
+        """存量自愈：清掉「旧格式、且当前不产生任何影响」的手动版本记录。
+
+        issue #1 评估（2026-10-12）发现的缺口：v1.8.11 及更早写下的手动版本
+        **没有内容签名**，而代码对没有签名的记录是「先沿用」（有意保留用户
+        数据）—— 于是"不冻结"机制对它们**完全不生效**。老用户升级上来，
+        那几条仍然永久生效，他看到的还是「更新了还说有更新」。
+
+        而逐条右键去清太贵（反馈者 16 条 ≈ 48 次点击，且没有批量入口）。
+        所以这里自动清掉**可证明无副作用**的那一类（手动值 == 自动探测值，
+        有它没它结论完全一样）；有实际影响的一律留着，交给用户在界面上核对。
+
+        ★ 失败不许静默，也不能让一次异常影响启动。
+        """
+        try:
+            n = arsenal.heal_legacy_overrides(self.library or [])
+        except Exception:  # noqa: BLE001
+            return 0
+        if n:
+            diag.event("清理", f"自动清理 {n} 条历史遗留的手动版本记录"
+                                "（它们与自动探测结果一致、不影响判断）")
+        return n
+
     def _auto_detect(self) -> None:
         if not self._alive():
             return
@@ -1167,6 +1212,14 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
                 self.var_status.set(f"已找到 Arsenal 模组库（{how}），共 {len(self.library)} 个模组")
                 diag.event("Arsenal 定位", f"找到（{how}）：{path}，"
                                           f"共 {len(self.library)} 个模组")
+                # ★ 顺手清掉孤儿记录（模组已删/换 uuid 但手动版本还留着）。
+                #   以前没人清，config.json 会越积越多，而用户早忘了填过。
+                self._prune_orphan_versions()
+                # ★ 存量自愈：清掉「旧格式且当前无影响」的手动版本记录。
+                #   为什么必须在**读到库之后**立刻做：这类记录会被永久沿用
+                #   （issue #1），老用户升级上来若不自动清，他看到的仍然是
+                #   「我明明更新过了，它还一直说有更新」。
+                self._heal_legacy_versions()
                 self._populate()
             except Exception as e:  # noqa: BLE001
                 error_box("读取失败", f"读不了这个文件：\n{e}",
@@ -1301,6 +1354,31 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
             return "未加入"
         return "已启用" if e.get("enabled") else "未启用"
 
+    @staticmethod
+    def _local_cell(r: dict) -> str:
+        """更新检查页「本地」列：版本号 + **它的来源标记**。
+
+        ★ 为什么一定要标出来（issue #1）：以前这里只有一个数字，
+        "手动填的旧值"和"自动探测到的真值"长得一模一样 —— 用户看到
+        「本地 1.1 / 线上 1.2」完全无从判断工具为什么一直催他更新，
+        最后只能来提 issue。而那个值是**他自己**被"顺手冻住"的。
+
+        三种情况：
+          · 手动值仍生效      → ``1.1（手动）``
+          · 手动值已失效      → ``1.2（你填的 1.1 已失效）``
+          · 自动              → ``1.2``
+        列窄（84px），所以失效那条靠「说明」列展开，格子里只留简短标记。
+        """
+        e = r.get("entry") or {}
+        ver = r.get("installed") or e.get("installed_version") or ""
+        base = ver or "?"
+        if e.get("override_stale"):
+            old = e.get("manual_version") or ""
+            return f"{base}（旧值{old}已失效）" if old else f"{base}（手动已失效）"
+        if e.get("version_is_manual"):
+            return f"{base}（手动）"
+        return base
+
     def _populate(self, results: list[dict] | None = None) -> None:
         self.tree.delete(*self.tree.get_children())
         self._row_widgets.clear()
@@ -1353,7 +1431,7 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
                 # 表格这一列窄，放不下多行说明 —— 但「被站点挡住」和
                 # 「页面不存在」要一眼能分开，所以这里压成一句话，
                 # 完整出路在双击行时给出的弹窗里（见 _show_error_detail）。
-                note = self._error_note(best.get("error") or "")
+                note = self._error_note(best.get("error") or "", best)
             elif r["status"] == ST_NO_SOURCE:
                 note = "没找到来源 —— 右键「指定来源…」填一次"
             elif r["status"] == ST_UNCHECKED:
@@ -1370,15 +1448,40 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
             if r.get("prev_download"):
                 note += "　（注意：上次下的那个文件已不在原处）"
 
+            # ★ 「手动填的本地版本」相关的说明（issue #1）：
+            #   这一格必须告诉用户**为什么**工具会这样判，否则他只会反复重装。
+            if e.get("override_stale"):
+                old = e.get("manual_version") or "?"
+                new = e.get("auto_version") or ""
+                note = (f"你手动填的「{old}」已自动失效"
+                        + (f"（模组内容变过了），现按自动探测的「{new}」判断"
+                           if new else
+                           "（模组内容变过了），但自动探测不出版本 → 版本存疑")
+                        + "　右键「本地版本…」选【是】即可清除")
+            elif e.get("version_is_manual") and e.get("manual_state"):
+                st = str(e.get("manual_state") or "")
+                if "旧格式" in st:
+                    # ★ 必须写清**按哪个键**（issue #1 评估）：只说"可清除"时
+                    #   用户可能在弹窗里按【否】（=自己填），而那个框的初值
+                    #   正是这条可疑的旧值 —— 一回车就把错值又存一遍。
+                    note = (f"本地版本 {r.get('installed')} 是你手动填的"
+                            "（还没和当前内容核对过）　"
+                            "右键「本地版本…」选【是】即可恢复自动")
+
             # 手工指定的来源，在说明里标出来
             checks = r.get("checks") or []
             if checks and any((c.get("_src") or {}).get("manual") for c in checks):
                 note = ("【手工指定】" + note).strip()
 
+            # ★ 本地版本这一格要让人看得出**它从哪来**（issue #1）：
+            #   以前只显示数字，"手动填的旧值"和"自动探测的真值"长得一模一样，
+            #   用户完全无从判断工具为什么会一直催他更新。
+            e_local = self._local_cell(r)
+
             iid = self.tree.insert(
                 "", "end",
                 values=(txt, self._profile_cell(e), label[:60],
-                        r.get("installed") or "?", remote, site, note),
+                        e_local, remote, site, note),
                 tags=(STATUS_TEXT.get(r["status"], ("",))[0],),
             )
             self._row_widgets.append({"iid": iid, "row": r, "entry": e})
@@ -1414,27 +1517,73 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
         self._update_hint(rows)
 
     @staticmethod
-    def _error_note(err: str) -> str:
+    def _error_note(err: str, best: dict | None = None) -> str:
         """把一条失败原因压成表格里放得下的一句话。
 
         为什么要分类：用户看到一列「查询失败」最需要立刻分清的是
         「站点不让我查」（换节点/等待）还是「这个 mod 本身有问题」（换来源），
         而不是一句笼统的"被站点拒绝"。
+
+        ★★ 2026-10-12 重构：**不再靠匹配错误文案来分类**。
+        旧实现踩了两个坑（用户报的）：
+          ① 写的是 `"被删除" in s`，而 provider 的文案是
+             「这个 mod 被**隐藏/删除**，或你的 key 无权访问」——
+             子串对不上 → 这条**永远不生效** → 落到下面的 `"key" in low`
+             → 把"这个 mod 已经没了"显示成**「需要 API key」**
+             （用户明明填了 key，只会去设置页反复确认）。
+          ② 上游以后改一个字（"已删除"→"下架"），下游就**静默失效**。
+        现在改成：**只认 provider 打的结构化标签 `err_kind`**，
+        文案怎么改都不影响分类。`best` 缺省时退回按文案兜底（兼容旧调用）。
+
+        分支顺序**按"用户下一步该干什么"排**：
+        mod 没了 → 站点挡了 → 网络 → 限流 → 凭据问题。
+        凭据类**必须放最后** —— 否则它会把前面几类全吃掉（正是旧版的病）。
         """
+        best = best or {}
+        kind = str(best.get("err_kind") or "")
         s = str(err or "").strip()
+
+        if not kind:
+            # 兼容：没有结构化标签时（旧数据 / 别的来源）按文案粗略兜底。
+            # ★ 顺序仍是"mod 级优先"：先看"没了/挡住"，最后才看凭据。
+            low = s.lower()
+            if not s:
+                return "查询失败（没有详细信息）——双击这一行看怎么办"
+            if ("不存在" in s or "删除" in s or "下架" in s or "改名" in s
+                    or "no mod found" in low or "not available" in low):
+                kind = "gone"
+            elif "cloudflare" in low or "被站点" in s or "挡住" in s:
+                kind = "site"
+            elif "超时" in s or "不可达" in s:
+                kind = "net"
+            elif "限流" in s or "429" in s:
+                kind = "rate"
+            elif "无效" in s or "过期" in s:
+                kind = "bad_key"
+            elif "没填" in s or "401" in s or "api key" in low:
+                kind = "no_key"
+            else:
+                kind = ""
+
+        if kind == "gone":
+            return "这个 mod 在站上已经没有了（可能已删除/改名）——双击看怎么办"
+        if kind == "site":
+            return "站点挡住了自动查询 —— 双击这一行看怎么办"
+        if kind == "net":
+            return "站点暂时连不上（超时）——过一会儿再试"
+        if kind == "rate":
+            return "请求太频繁被限流 —— 过一会儿再试"
+        if kind == "noperm":
+            return "看不到这个 mod（被隐藏/锁了）——双击看怎么办"
+        if kind == "bad_key":
+            return "N网 API key 无效或已过期 —— 到「设置…」换一个"
+        if kind == "no_key":
+            return "需要 API key —— 到「设置…」里填"
+        if kind == "shape":
+            return "页面结构变了，读不出信息（站点可能改版）——双击看怎么办"
+
         if not s:
             return "查询失败（没有详细信息）——双击这一行看怎么办"
-        low = s.lower()
-        if "cloudflare" in low or "被站点" in s or "挡住" in s:
-            return "站点挡住了自动查询 —— 双击这一行看怎么办"
-        if "不存在" in s or "被删除" in s or "改名" in s:
-            return "这个页面不存在了（mod 可能已删除/改名）——双击看怎么办"
-        if "超时" in s or "不可达" in s:
-            return "站点暂时连不上（超时）——过一会儿再试"
-        if "限流" in s or "429" in s:
-            return "请求太频繁被限流 —— 过一会儿再试"
-        if "401" in s or "key" in low:
-            return "需要 API key —— 到「设置…」里填"
         first = s.splitlines()[0]
         return (first[:70] + "…") if len(first) > 70 else first
 
@@ -2666,6 +2815,172 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
         self._after_source_change(entry)
         self._undo_restore = {"key": key, "entry": entry, "gone": gone}
         self._start_check(only_keys={key})
+
+    def _ctx_local_version(self) -> None:
+        """查看 / 修改 / 恢复自动探测的本地版本（issue #1 的出口）。
+
+        为什么要有这个入口：用户手动填的版本以前会被**永久**记住，
+        而界面上完全看不出这个数字是手动来的 —— 反馈者 30 个模组里 16 个
+        被冻住、其中 14 个是"装完新版就误报"的定时炸弹，而他自己完全不知情。
+        这里给出：看清现状 → 有问题的走「恢复自动」（默认项）／自己填一个新值。
+        """
+        w = self._selected()
+        if not w:
+            return
+        entry = w["entry"]
+        uuid = entry.get("uuid") or ""
+        if not uuid:
+            messagebox.showinfo("没有这个模组", "这一行没有 uuid，无法记录版本。")
+            return
+        label = entry.get("label") or entry.get("dirname") or "(未命名)"
+        cur = arsenal.get_version_override(uuid)
+        auto = entry.get("auto_version") or ""
+        used = entry.get("installed_version") or auto or ""
+        stale = bool(entry.get("override_stale"))
+        state = str(entry.get("manual_state") or "")
+        # 「旧格式记录」= 没有内容签名（v1.8.11 及更早写的）→ 已绕过"不冻结"
+        #   机制，属于**确实有问题、要问用户**的情况（见下面的弹窗设计）。
+        _is_legacy = bool(entry.get("override_legacy")) and bool(cur)
+
+        if stale:
+            head = (f"你之前填的「{entry.get('manual_version')}」已经自动失效了"
+                    f"（{state}）。\n\n"
+                    + (f"现在按自动探测到的「{auto}」判断。"
+                       if auto else
+                       "但自动探测不出这个模组的版本号，所以现在显示「版本存疑」——"
+                       "如果你知道实际版本，可以在这里填。"))
+        elif cur:
+            head = (f"当前本地版本「{used}」是你手动填的。\n"
+                    + (f"自动探测到的是「{auto}」。\n" if auto and auto != cur else "")
+                    + f"\n（{state}）")
+        else:
+            head = (f"当前本地版本「{used or '未知'}」是自动探测的，没有手动记录。"
+                    + (f"\n自动探测到的就是「{auto}」。" if auto else ""))
+
+        box = (f"· 现在采用的：{used or '未知'}\n"
+               f"· 自动探测到：{auto or '（探测不出）'}\n"
+               f"· 你手动填过：{cur or '（没有）'}\n\n"
+               + head)
+        # ★★ 弹窗设计（issue #1，2026-10-12 修正）：**安全动作必须是默认**。
+        #   旧版是三选一（是=恢复自动 / 否=重新填写 / 取消=不动），但：
+        #     · 说明里只写「右键『本地版本…』可清除」，没写按哪个键；
+        #     · 而【否】分支的输入框初值就是**那条旧值**（initialvalue=cur）——
+        #       用户不清楚情况直接回车，会把旧值以**新格式**重新写一遍
+        #       （带上当前内容签名）→「还没核对过内容」的提示消失、值还是错的，
+        #       变成一条**看起来健康**的冻结记录，比不按更糟。
+        #   现在：默认键按"哪种动作不会让情况变糟"来定，并且**写清按哪个键**。
+        #
+        #   ★ 关键区分（实测反馈者的 16 条后补的）：
+        #     · 自动探测**有值** → 清掉 = 改用自动值，值明确 → 推荐【是】
+        #     · 自动探测**为空** → 清掉会把"有版本可比"变成"版本存疑"，
+        #       等于删掉用户唯一能比大小的依据（他的 Mine Flags (AiO) 就是
+        #       这种）→ **不能**推荐清，默认改成【否】（保持不动）
+        can_clear = bool(auto) or bool(stale)
+        problem = bool(stale) or _is_legacy
+        if not problem:
+            # 一切正常 —— 只问"要不要改"，默认【否】（什么都不做）
+            if not messagebox.askyesno(
+                    "本地版本",
+                    box + "\n\n这个模组的版本信息看起来是正常的。\n"
+                         "要现在修改它吗？（选「否」就什么都不做）",
+                    parent=self, default="no"):
+                return
+            typed = simpledialog.askstring(
+                "填写本地版本",
+                f"给「{label}」填一个本地版本号：\n\n"
+                + (f"（自动探测到「{auto}」；留空 = 恢复自动探测）\n" if auto else
+                   "（留空 = 不记录版本，这个模组会显示「版本存疑」）\n"),
+                initialvalue=cur or auto or "", parent=self)
+            if typed is None:
+                return
+            typed = typed.strip()
+            arsenal.set_version_override(
+                uuid, typed, arsenal.content_sig(entry.get("path") or ""))
+            self.var_status.set(
+                f"已记录：「{label}」的本地版本 = {typed or '（自动探测）'}")
+            self._refresh_one_version(uuid, entry, recheck=True)
+            return
+
+        if can_clear:
+            # 推荐动作 = 恢复自动探测；回车即执行（默认键就是它）
+            ans = messagebox.askyesno(
+                "本地版本",
+                box + "\n\n要怎么处理？\n"
+                     f"【是】= 恢复自动探测"
+                     f"（改回用自动探测到的「{auto}」）　← 直接回车就是这一项\n"
+                     "【否】= 我自己填一个版本号",
+                parent=self, default="yes")
+            if ans:
+                arsenal.clear_version_override(uuid)
+                self.var_status.set(f"已恢复自动探测：「{label}」")
+                self._refresh_one_version(uuid, entry)
+                return
+            # 【否】= 自己填。★ 初值给**自动探测值**（或空白），
+            #   绝不再预填那条可疑的旧值 —— 否则用户一回车就把错值又存一遍。
+            typed = simpledialog.askstring(
+                "填写本地版本",
+                f"给「{label}」填你现在装的那个版本号：\n\n"
+                + (f"（自动探测到「{auto}」；留空 = 就用它）\n" if auto else
+                   "（留空 = 不记录版本，这个模组会显示「版本存疑」）\n")
+                + (f"\n注意：不要沿用「{cur}」—— 那正是可能过期的那个值。"
+                   if cur else ""),
+                initialvalue=auto or "", parent=self)
+            if typed is None:
+                return
+            typed = typed.strip()
+            arsenal.set_version_override(
+                uuid, typed, arsenal.content_sig(entry.get("path") or ""))
+            self.var_status.set(
+                f"已记录：「{label}」的本地版本 = {typed or '（自动探测）'}")
+            self._refresh_one_version(uuid, entry, recheck=True)
+            return
+
+        # ★ 自动探测不出值 → **不能**推荐"恢复自动"（那会把唯一的依据删掉）。
+        #   默认【否】= 保持不动；选【是】才去重新填一个。
+        if not messagebox.askyesno(
+                "本地版本",
+                box + "\n\n"
+                "注意：这个模组【自动探测不出版本号】，所以你现在填的"
+                f"「{cur}」是工具唯一能用来比大小的依据。\n"
+                "清掉它会让这个模组变成「版本存疑」（不是更准，而是更少信息）。\n\n"
+                "要改成别的版本号吗？\n"
+                "【否】= 保持现在这个　← 直接回车就是这一项\n"
+                "【是】= 我重新填一个",
+                parent=self, default="no"):
+            return
+        typed = simpledialog.askstring(
+            "填写本地版本",
+            f"给「{label}」填你现在装的那个版本号：\n"
+            f"（现在是「{cur}」；留空 = 清掉记录、显示「版本存疑」）",
+            initialvalue=cur or "", parent=self)
+        if typed is None:
+            return
+        typed = typed.strip()
+        arsenal.set_version_override(
+            uuid, typed, arsenal.content_sig(entry.get("path") or ""))
+        self.var_status.set(
+            f"已记录：「{label}」的本地版本 = {typed or '（自动探测）'}")
+        self._refresh_one_version(uuid, entry, recheck=True)
+
+    def _refresh_one_version(self, uuid: str, entry: dict,
+                             recheck: bool = False) -> None:
+        """改完版本记录后，把这一行的结论就地刷新（否则界面还显示旧结论）。
+
+        ``entry`` 是重读库时给的旧对象 —— 必须重读，不能就地改它。
+        填了新值要重新查一次线上版本（状态是拿本地版本算出来的）；
+        恢复自动则只需重画，不必再联网。
+        """
+        fresh = entry
+        try:
+            for e in load_library(self.data_file):
+                if e.get("uuid") == uuid:
+                    fresh = e
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+        self._after_source_change(fresh)
+        if recheck:
+            self._start_check(only_keys={source_key(fresh)})
 
     def _maybe_restore_after_undo(self, rows: list[dict]) -> None:
         """撤销+重识别之后，如果这一条仍然没有任何来源，就把原记录放回去。
@@ -5730,25 +6045,48 @@ class SourceDialog(tk.Toplevel):
         self.lbl_detect.pack(anchor="w", padx=14, pady=(4, 0))
 
         # ---- 本地版本（有些 mod 没写版本号，需要用户填）----
+        # ★ 这里显示的一律是**自动探测值**（entry["auto_version"]），
+        #   不能用 installed_version —— 那个在有手动记录时**已经是手动值**了，
+        #   拿它当"自动探测到"会把手动值说成自动的，用户据此看不出问题
+        #   （issue #1 的原话：版本填了 1.1、实际装的是 1.2，界面却在说
+        #     「自动探测到：1.1」）。
         verbox = ttk.Frame(self)
         verbox.pack(fill="x", padx=14, pady=(10, 0))
-        auto = entry.get("installed_version") or ""
-        cur = arsenal.get_version_override(entry.get("uuid") or "") or auto
+        uuid = entry.get("uuid") or ""
+        auto = entry.get("auto_version") or ""
+        cur_manual = arsenal.get_version_override(uuid)
+        cur = cur_manual or auto
         ttk.Label(verbox, text="② 本地版本（可选）",
                   style="TLabel", font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
         row_v = ttk.Frame(verbox)
         row_v.pack(fill="x")
+        # 记住"打开这个框时是什么值" —— 保存时据此判断用户**是否真的改过**
+        #（用户只想指定来源、没碰版本框时，不能顺手把版本冻住：issue #1 的根因）
+        self._ver_initial = cur
         self.var_localver = tk.StringVar(value=cur)
         tk.Entry(row_v, textvariable=self.var_localver, bg=BG3, fg=FG,
                  insertbackground=FG, relief="flat", font=("Consolas", 10),
                  width=18).pack(side="left", ipady=4)
-        note = ("自动探测不到版本号，请手动填你装的那个版本"
-                if not auto else f"自动探测到：{auto}")
-        ttk.Label(row_v, text=note, style="Dim.TLabel").pack(side="left", padx=(8, 0))
-        ttk.Label(verbox,
-                  text="用途：版本号用来判断「线上有没有更新」。若这里留空，"
-                       "这个模组会显示「版本存疑」，而不是误报有更新。",
-                  style="Dim.TLabel", wraplength=650,
+        if cur_manual:
+            # 有手动记录：把两个值都摆出来，别让用户以为"自动探测"就是它
+            if auto and auto != cur_manual:
+                note = f"当前用你手动填的 {cur_manual}（自动探测到 {auto}）"
+            else:
+                note = f"当前用你手动填的 {cur_manual}"
+            note_color = ORANGE
+        elif auto:
+            note = f"自动探测到：{auto}"
+            note_color = FG_DIM
+        else:
+            note = "自动探测不到版本号，请手动填你装的那个版本"
+            note_color = FG_DIM
+        ttk.Label(row_v, text=note, style="Dim.TLabel",
+                  foreground=note_color).pack(side="left", padx=(8, 0))
+        extra = ("用途：版本号用来判断「线上有没有更新」。若这里留空，"
+                 "这个模组会显示「版本存疑」，而不是误报有更新。\n"
+                 "你填的值会**跟着这个模组的内容走** —— 之后你更新了它，"
+                 "这个手动值会自动失效、回到自动探测（不会再一直催你更新）。")
+        ttk.Label(verbox, text=extra, style="Dim.TLabel", wraplength=650,
                   justify="left").pack(anchor="w", pady=(3, 0))
 
         # ---- 示例（可点击直接填入）----
@@ -5863,9 +6201,28 @@ class SourceDialog(tk.Toplevel):
         set_manual_source(self.entry_data, {
             k: v for k, v in got.items() if k != "display"})   # 打 manual 标记，受保护
         # 顺便记住用户填的本地版本（用于判断有没有更新）
+        #
+        # ★ 只在用户**真的改了**那个框时才写（issue #1 的根因）：
+        #   以前是无条件写，于是"我只想指定一下来源"这个动作会把当时的
+        #   版本号永久冻住 —— 用户自己都没意识到，之后模组更新了，
+        #   工具还在拿那个旧值比，于是永远显示「有更新」。
+        #   现在：没改过 → 一个字节都不动（保持原样，包括"本来就没有记录"）。
+        #   改过   → 连同"此刻的内容签名"一起记下（见 arsenal.set_version_override），
+        #            将来内容一变，这个手动值会自动失效。
         uv = self.entry_data.get("uuid") or ""
-        if uv:
-            arsenal.set_version_override(uv, self.var_localver.get().strip())
+        typed = self.var_localver.get().strip()
+        ver_msg = ""
+        if uv and typed != getattr(self, "_ver_initial", ""):
+            arsenal.set_version_override(
+                uv, typed, arsenal.content_sig(self.entry_data.get("path") or ""))
+            if typed:
+                ver_msg = f"\n· 本地版本：已按你填的「{typed}」判断"
+                ver_msg += ("（跟着模组内容走，更新后会自动失效）"
+                            if typed else "")
+            else:
+                ver_msg = "\n· 本地版本：已清空，改回自动探测"
+        elif uv:
+            ver_msg = "\n· 本地版本：没改，保持原样"
         # 让主界面更新本地版本显示（改了 override 后 entry 需要重读）
         if uv:
             try:
@@ -5883,7 +6240,8 @@ class SourceDialog(tk.Toplevel):
             "已保存",
             f"已记录为 {name} 来源（标记为「手工指定」）。\n\n"
             "· 以后自动识别不会覆盖它\n"
-            "· 「清空来源缓存」也不会删掉它\n\n"
+            "· 「清空来源缓存」也不会删掉它\n"
+            f"{ver_msg}\n\n"
             "现在点「检查更新」就会去这个页面查版本。",
             parent=self.master,
         )

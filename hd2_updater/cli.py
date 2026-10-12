@@ -314,6 +314,231 @@ def main(argv: list[str] | None = None) -> int:
             print("selftest=FAIL 备份页不可用")
             return 3
 
+        # ------------------------------------------------------------------
+        # issue #1「我明明更新过了，它还一直说有更新」的核心判定（2026-10-12）
+        #
+        # 为什么放在 selftest 里而不是只放在 tests/：这里跑的是**打包后的 EXE**
+        # 也会走的同一条代码路径。以前"本地版本"被永久冻住、导入还会抹掉
+        # Arsenal 的 nexusData —— 这类"改了但测不出来"的东西，只有在真程序里
+        # 验一遍才算数。
+        try:
+            import json as _js
+            import os as _os2
+            import tempfile as _tf2
+            from . import arsenal as _ar
+            from .engine import evaluate as _ev
+            from .gui import App as _App
+
+            _t = _tf2.mkdtemp(prefix="hd2u_selftest_v_")
+            _md = _os2.path.join(_t, "mods")
+            _uu = "eeee1111-2222-3333-4444-555566667777"
+            _d0 = _os2.path.join(_md, "Some Mod 16493 10 2026-01-01T00-00Z x_AR1")
+            _os2.makedirs(_d0)
+            for _i in range(3):
+                with open(_os2.path.join(_d0, f"slot{_i}.patch_0"), "wb") as _fh:
+                    _fh.write(b"content-%d-v10" % _i)
+            _ent = {"uuid": _uu, "label": "Some Mod", "path": _d0,
+                    "description": "", "iconPath": None, "tags": ["misc"],
+                    "patchFileNames": [], "options": [], "contentHash": "",
+                    "addedAt": "2026-01-01T00:00:00.000Z",
+                    "previousVersions": [],
+                    "nexusData": {"modId": "16493", "fileId": "555",
+                                  "version": "12", "updateTimestamp": 1}}
+            _pr = dict(_ent)
+            _pr.update({"enabled": True, "deployed": True, "changed": False,
+                        "new": False, "copiedFiles": [], "renamedFiles": []})
+            _df2 = _os2.path.join(_t, "hd2a_data.json")
+            with open(_df2, "w", encoding="utf-8") as _f:
+                _js.dump({"modsLibrary": [_ent],
+                          "modsList": {"Default Profile": {"mods": [_pr]}},
+                          "selectedProfile": "Default Profile",
+                          "userModsDir": _md, "userGameDir": "D:\\g",
+                          "setTopPriority": False}, _f, ensure_ascii=False)
+            # 内容签名：算得出 + 稳定
+            _s1 = _ar.content_sig(_d0)
+            _same = (_ar.content_sig(_d0) == _s1 and bool(_s1))
+            # 记下手动值（带签名）→ 应生效
+            _ar.set_version_override(_uu, "10", _ar.content_sig(_d0, fresh=True))
+            _e = _ar.load_library(_df2)[0]
+            _manual_ok = (_e["installed_version"] == "10"
+                          and _e["version_is_manual"])
+            # ★ 内容变了 → 手动值必须自动失效
+            _d1 = _os2.path.join(_md, "Some Mod 16493 12 2026-10-11T11-52Z y_AR2")
+            _os2.rename(_d0, _d1)
+            for _i in range(3):
+                with open(_os2.path.join(_d1, f"slot{_i}.patch_0"), "wb") as _fh:
+                    _fh.write(b"content-%d-v12-NEW" % _i)
+            with open(_df2, encoding="utf-8") as _f:
+                _d2 = _js.load(_f)
+            _d2["modsLibrary"][0]["path"] = _d1
+            with open(_df2, "w", encoding="utf-8") as _f:
+                _js.dump(_d2, _f, ensure_ascii=False)
+            _e2 = _ar.load_library(_df2)[0]
+            _unfrozen = (not _e2["version_is_manual"]
+                         and _e2["override_stale"])
+            _followed = (_e2["installed_version"] == "12")
+            _st = _ev(_e2, [{"provider": "nexus", "ok": True,
+                             "version": "12", "url": "x",
+                             "download_url": ""}])["status"]
+            _clear = _ar.clear_version_override(_uu)
+            import shutil as _sh2
+            _sh2.rmtree(_t, ignore_errors=True)
+            if not (_same and _manual_ok and _unfrozen and _followed
+                    and _st == "ok" and _clear):
+                print(f"version=FAIL sig={_same} manual={_manual_ok} "
+                      f"unfrozen={_unfrozen} followed={_followed} "
+                      f"status={_st} clear={_clear}")
+                print("selftest=FAIL 本地版本「不冻结」判定不对")
+                return 3
+            print(f"version=OK 签名稳定={_same} 手动生效={_manual_ok} "
+                  f"自动解冻={_unfrozen} 跟上新版={_followed} 判定={_st} "
+                  f"可清除={_clear}")
+
+            # ★★ 第二个根因（用户 2026-10-12 实测）：导入更新版会**复用旧目录**，
+            #   文件夹名里那个版本号是永久旧值（"…-v40" 里装着 v41 的内容），
+            #   而本地版本原本优先读文件夹名 → 永远报「有更新」。
+            #   这里照用户实测的那两个 mod 的真实目录名走一遍导入。
+            _zip_ok = True
+            try:
+                import zipfile as _zf
+                _t2 = _tf2.mkdtemp(prefix="hd2u_selftest_i_")
+                _md2 = _os2.path.join(_t2, "mods")
+                _os2.makedirs(_md2)
+                for _uu2, _dir2, _zn, _want in (
+                        ("c0000000-0000-0000-0000-000000000001",
+                         "HD2Runtime-0.30.3-runtime_AR172840",
+                         "HD2Runtime-0.31.3-runtime.zip", "0.31.3"),
+                        ("c0000000-0000-0000-0000-000000000002",
+                         "Vanilla-Plus-Megapack-v40_AR205686",
+                         "Vanilla-Plus-Megapack-v41.zip", "41")):
+                    _dd = _os2.path.join(_md2, _dir2)
+                    _os2.makedirs(_dd)
+                    with open(_os2.path.join(_dd, "a.patch_0"), "wb") as _fh:
+                        _fh.write(b"old content")
+                    _e3 = {"uuid": _uu2, "label": _os2.path.splitext(_zn)[0],
+                           "path": _dd, "description": "", "iconPath": None,
+                           "tags": ["misc"], "patchFileNames": [],
+                           "options": [], "contentHash": "",
+                           "addedAt": "", "previousVersions": [],
+                           "nexusData": None}
+                    _p3 = dict(_e3)
+                    _p3.update({"enabled": True, "deployed": True,
+                                "changed": False, "new": False,
+                                "copiedFiles": [], "renamedFiles": []})
+                    _df3 = _os2.path.join(_t2, "hd2a_data.json")
+                    with open(_df3, "w", encoding="utf-8") as _f:
+                        _js.dump({"modsLibrary": [_e3],
+                                  "modsList": {"P": {"mods": [_p3]}},
+                                  "selectedProfile": "P",
+                                  "userModsDir": _md2,
+                                  "userGameDir": "D:\\g",
+                                  "setTopPriority": False}, _f,
+                                 ensure_ascii=False)
+                    _zp = _os2.path.join(_t2, _zn)
+                    with _zf.ZipFile(_zp, "w") as _z:
+                        _z.writestr("manifest.json", _js.dumps(
+                            {"Name": _os2.path.splitext(_zn)[0], "Guid": _uu2}))
+                        _z.writestr("a.patch_0",
+                                    ("brand new " + _want).encode())
+                    from . import modimport as _MI
+                    _MI.import_zip(_df3, _zp, mods_dir=_md2, api_key="")
+                    _row = next(x for x in _ar.load_library(_df3)
+                                if x["uuid"] == _uu2)
+                    if _row["installed_version"] != _want:
+                        _zip_ok = False
+                        break
+                import shutil as _sh3
+                _sh3.rmtree(_t2, ignore_errors=True)
+            except Exception as e:  # noqa: BLE001
+                _zip_ok = False
+                print(f"   import 校验异常：{e}")
+            if not _zip_ok:
+                print("version2=FAIL 导入新版后本地版本没跟上"
+                      "（文件夹名停在旧版本号 → 会永远报有更新）")
+                print("selftest=FAIL 导入后版本识别不对")
+                return 3
+            print("version2=OK 导入新版后本地版本跟上"
+                  "（复用旧目录时也能认对）")
+
+            # ★★ 存量自愈（2026-10-12，issue #1 评估查出的缺口）：
+            #   老用户升级上来时，v1.8.11 写的旧格式记录（没有内容签名）
+            #   会被永久沿用 —— "不冻结"机制对它完全不生效，于是他仍然看到
+            #   「更新了还说有更新」。这里清掉**可证明无副作用**的那一类
+            #   （手动值 == 自动探测值），有实际影响 / 自动值探测不出的留着。
+            try:
+                _th = _tf2.mkdtemp(prefix="hd2u_selftest_h_")
+                _mh = _os2.path.join(_th, "mods")
+                _uh = "hhhh1111-2222-3333-4444-555566667777"
+                _dh = _os2.path.join(_mh, "Heal 16493 5 2026-01-01T00-00Z h_AR1")
+                _os2.makedirs(_dh)
+                with open(_os2.path.join(_dh, "a.patch_0"), "wb") as _fh:
+                    _fh.write(b"heal content")
+                _eh = {"uuid": _uh, "label": "Heal", "path": _dh, "description": "",
+                       "iconPath": None, "tags": ["misc"], "patchFileNames": [],
+                       "options": [], "contentHash": "", "addedAt": "",
+                       "previousVersions": [], "nexusData": None}
+                _ph = dict(_eh)
+                _ph.update({"enabled": True, "deployed": True, "changed": False,
+                            "new": False, "copiedFiles": [], "renamedFiles": []})
+                _dfh = _os2.path.join(_th, "hd2a_data.json")
+                with open(_dfh, "w", encoding="utf-8") as _f:
+                    _js.dump({"modsLibrary": [_eh],
+                              "modsList": {"P": {"mods": [_ph]}},
+                              "selectedProfile": "P", "userModsDir": _mh,
+                              "userGameDir": "D:\\g", "setTopPriority": False},
+                             _f, ensure_ascii=False)
+                # v1.8.11 的旧格式记录：手动值 5 == 自动探测 5 → 应被清
+                import hd2_updater.util as _u2
+                _cfg_h = _os2.path.join(_u2.app_data_dir(), "config.json")
+                with open(_cfg_h, "w", encoding="utf-8") as _f:
+                    _js.dump({"version_overrides": {_uh: "5"}}, _f)
+                _rows_h = _ar.load_library(_dfh)
+                _legacy_ok = bool(_rows_h[0].get("override_legacy"))
+                _n_h = _ar.heal_legacy_overrides(_rows_h)
+                _cleared = (_uh not in (_ar.read_version_overrides() or {}))
+                _still = _ar.load_library(_dfh)[0]["installed_version"] == "5"
+                import shutil as _sh4
+                _sh4.rmtree(_th, ignore_errors=True)
+                if not (_legacy_ok and _n_h == 1 and _cleared and _still):
+                    print(f"heal=FAIL legacy={_legacy_ok} n={_n_h} "
+                          f"cleared={_cleared} value_kept={_still}")
+                    print("selftest=FAIL 存量自愈不对"
+                          "（老用户升级后旧记录不会被清）")
+                    return 3
+                print(f"heal=OK 认出旧格式={_legacy_ok} 清掉={_n_h} "
+                      f"记录已删={_cleared} 结论不变={_still}")
+            except Exception as e:  # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+                print(f"heal=FAIL {e}")
+                print("selftest=FAIL 存量自愈模块不可用")
+                return 3
+
+            # ★ 错误分类（2026-10-12：「已删除的 mod 被说成没填 key」）
+            #   核心：分类靠结构化标签、不靠文案子串；mod 级优先于凭据级。
+            from .providers import kind_of_http as _koh
+            from .gui import App as _App2
+
+            _gone = _koh(403, '{"message":"Mod not available: 2"}')
+            _noperm = _koh(403, "Forbidden")
+            _nf = _koh(404, '{"message":"No Mod Found: 9"}')
+            _note = _App2._error_note("这个 mod 被隐藏/删除，或你的 key 无权访问")
+            _ok_note = "API key" not in _note
+            if not (_gone == "gone" and _noperm == "noperm"
+                    and _nf == "gone" and _ok_note):
+                print(f"errkind=FAIL 403删={_gone} 403权限={_noperm} "
+                      f"404={_nf} 已删除提示不提key={_ok_note}")
+                print("selftest=FAIL 错误分类不对（删除会被说成没填 key）")
+                return 3
+            print(f"errkind=OK 403已删除={_gone} 403无权限={_noperm} "
+                  f"404={_nf} 「已删除」提示不再提 key={_ok_note}")
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            print(f"version=FAIL {e}")
+            print("selftest=FAIL 本地版本模块不可用")
+            return 3
+
         print("selftest=OK")
         return 0
 

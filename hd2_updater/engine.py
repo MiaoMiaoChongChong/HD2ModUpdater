@@ -152,8 +152,7 @@ def check_one_source(src: dict, api_key: str, github_token: str,
     if prov == "ayaka":
         return providers.ayaka_check(url or ident)
     out = providers._empty(prov or "?")
-    out["error"] = f"不认识的来源类型：{prov}"
-    return out
+    return providers._err(out, "other", f"不认识的来源类型：{prov}")
 
 
 def check_one_source_all(src: dict, api_key: str, github_token: str,
@@ -225,7 +224,10 @@ def evaluate(entry: dict, checks: list[dict]) -> dict:
             else:
                 why = (f"两边格式不同，没法比大小：本地「{installed}」vs 线上「{online}」。"
                        f"大多是站点把「版本」栏填成了日期。")
-            c2 = {**c, "ok": False, "error": why, "unknown_ver": True}
+            # err_kind 清空：这不是"查询失败"，是"版本比不了"。
+            # 留着上游的 kind 会让下游把「版本存疑」误当网络失败处理。
+            c2 = {**c, "ok": False, "error": why, "unknown_ver": True,
+                  "err_kind": ""}
             unknown.append(c2)
 
     def rank(c: dict) -> tuple:
@@ -258,12 +260,19 @@ def evaluate(entry: dict, checks: list[dict]) -> dict:
         best = None
         status = ST_NO_SOURCE
 
-    # 特别提示：只有 N 网来源但没有 API key —— 这不是"失败"，
+    # 特别提示：只有 N 网来源但**没填** API key —— 这不是"失败"，
     # 而是"需要设置一下"，给用户明确的下一步。
+    #
+    # ★★ 2026-10-12 收窄条件（用户报的 bug）：
+    #   旧的判断是 `if "API key" in err or "没填" in err:` ——
+    #   它会连带命中 provider 的 `API key 无效或已过期`，把"你的 key 有毛病
+    #   （该去换一个）"改写成"你没填 key（该去填）"。两件事被说成一件，
+    #   用户拿着一个明明填着的框反复确认。
+    #   现在**只认结构化标签** `err_kind == "no_key"`（真的没填才提示去填）；
+    #   "key 无效" 是另一类（bad_key），保留 provider 的原话。
+    #   另外 `"没填" in err` 也太宽（任何含"没填"的文案都会被改写），一并去掉。
     if status == ST_ERROR and best is not None:
-        err = str(best.get("error") or "")
-        if "API key" in err or "没填" in err:
-            status = ST_ERROR
+        if str(best.get("err_kind") or "") == "no_key":
             best = dict(best)
             best["error"] = "需要设置 N网 API key（设置… 里填）—— 填了才能自动查 N网"
 
@@ -555,7 +564,7 @@ class Engine:
                     got = fut.result()
                 except Exception as e:  # noqa: BLE001
                     got = providers._empty(src.get("provider", "?"))
-                    got["error"] = f"意外错误：{e}"
+                    got = providers._err(got, "other", f"意外错误：{e}")
                 # check_one_source_all 可能返回多条（GitHub 正式版 + 更新的预发布版）
                 for res in (got if isinstance(got, list) else [got]):
                     res["_src"] = src

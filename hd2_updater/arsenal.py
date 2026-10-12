@@ -10,6 +10,7 @@ Arsenal 的数据位置（按优先级）：
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -19,6 +20,356 @@ from .util import app_data_dir
 
 ARSENAL_DIRNAME = "hd2arsenal"
 DATA_FILENAME = "hd2a_data.json"
+
+# .patch_ 是所有 HD2 mod 的补丁文件标志（modimport 里也用同一个）
+_PATCH_MARK = ".patch_"
+
+
+# ==========================================================================
+# 「手动填的本地版本」——内容签名机制
+# ==========================================================================
+# ★ 背景（2026-10-12，GitHub issue #1）：
+#   用户手动填过本地版本后，这个值被**永久**记在 config.json 里，
+#   并且优先级最高（压过 nexusData.version / 目录名 / 元数据）。
+#   结果：模组更新之后，这个旧值仍然压着新的真实版本，于是工具**永远**
+#   显示「有更新」，用户重装多少次都没用（实测反馈者 30 个模组里 17 个
+#   被冻住、其中 14 个是"装完下个版本就误报"的定时炸弹）。
+#
+# ★ 修法（用户提案「版本号设计成不冻结的」）：
+#   记录格式从 `"1.1"` 改成 `{"version": "1.1", "sig": "<内容签名>"}`，
+#   **sig = 填这个版本时，模组内容的签名**。
+#   于是：
+#     · 内容没变（sig 一致）→ 模组没被动过 → 手动值仍然成立（冻结是安全的）
+#     · 内容变了（sig 不一致）→ 模组被更新过 → **手动值自动失效**，改回自动探测
+#   这就是"不冻结"：**冻结只在内容确实没变期间成立**，模组一更新就自动解冻。
+#
+# ★ 为什么签名要自己算，而不是复用 Arsenal 的 contentHash / mtime：
+#   · Arsenal 的 contentHash：我们**只能复现 16/21**（多选项模组它的合并算法
+#     没解出，见 modimport.build_entry 的注释），拿它当签名会误判。
+#   · patch 文件的 mtime：实测 **8/21 是 1980-01-01**（解包没带时间戳），不可用。
+#   · 只记文件大小：实测"内容全换但大小不变"时签名不变 → 会漏判更新。
+#   所以只能用「相对路径 + 内容」一起哈希。实测 21/21 稳定、成本 0.21 秒。
+_sig_cache: dict[str, tuple[tuple, str]] = {}
+
+
+def content_sig(path: str, fresh: bool = False) -> str:
+    """算模组目录的**内容签名**（读 ``.patch_`` 文件）。
+
+    同一份内容永远得到同一个签名，内容变了一定不同。
+
+    为什么只看 ``.patch_``：那才是 mod 的**实际内容**；同目录下的
+    manifest / png / txt 是元数据，作者改个描述不该被当成"更新了"。
+
+    ★ ``fresh=True`` 表示**不许用缓存**，必须重算 —— 用于"内容变了吗"这种
+      判断。它必须这么做：手动版本会不会失效，完全取决于这个判断对不对；
+      而缓存的判据只有 (清单, 大小, mtime)，两次快速改写**可能**落在同一个
+      时间刻度里（实测 Windows 上 st_mtime 有 100ns 精度，但同一 tick 内
+      连写两次仍会撞上），那样就会漏判"已更新" → 手动值永远不失效，
+      又回到 issue #1 那个坑。
+      代价实测很小：21 个模组 / 260MB 全量重算只要 0.21 秒。
+    """
+    if not path:
+        return ""
+    try:
+        real = os.path.normcase(os.path.abspath(path))
+    except (OSError, ValueError):
+        return ""
+    if not os.path.isdir(path):
+        return ""
+    files: list[tuple[str, int, int]] = []
+    try:
+        for root, _dirs, names in os.walk(path):
+            for n in names:
+                if _PATCH_MARK in n:
+                    fp = os.path.join(root, n)
+                    try:
+                        st = os.stat(fp)
+                    except OSError:
+                        continue
+                    files.append((os.path.relpath(fp, path), st.st_size,
+                                  int(st.st_mtime_ns)))
+    except OSError:
+        return ""
+    if not files:
+        return ""
+    files.sort(key=lambda t: t[0].lower())
+    cached = _sig_cache.get(real)
+    if not fresh and cached and cached[0] == tuple(files):
+        return cached[1]
+    h = hashlib.sha256()
+    for rel, _sz, _mt in files:
+        h.update(rel.replace("\\", "/").encode("utf-8", "replace") + b"\0")
+        try:
+            with open(os.path.join(path, rel), "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+        except OSError:
+            h.update(b"<unreadable>")
+    sig = h.hexdigest()
+    _sig_cache[real] = (tuple(files), sig)
+    return sig
+
+
+def _override_parts(rec) -> tuple[str, str]:
+    """把一条 override 记录拆成 ``(版本, 内容签名)``。
+
+    兼容两种格式：
+      · 新格式 ``{"version": "1.1", "sig": "abc…"}``
+      · 旧格式 ``"1.1"``（v1.8.11 及以前写下的，没有签名）
+    """
+    if isinstance(rec, dict):
+        return str(rec.get("version") or "").strip(), str(rec.get("sig") or "").strip()
+    return str(rec or "").strip(), ""
+
+
+def _resolve_override(rec, path: str) -> tuple[str, str, str]:
+    """判断这条 override 还能不能用。
+
+    返回 ``(可用版本, 内容签名, 原因)``：
+      · ``("",  sig, 原因)`` → **不可用**（已失效），调用方改用自动探测
+      · ``(版本, sig, 原因)`` → 可用
+
+    判定规则（就是「不冻结」那套）：
+      · 旧格式（没有签名）→ **仍然可用**。不能因为"缺签名"就丢弃用户填的值
+        —— 那等于"修 bug 把好数据删了"。这类交给界面提示 + 「恢复自动」。
+      · 有签名且和当前内容一致 → 可用（模组没被动过）。
+      · 有签名但和当前内容不一致 → **失效**（模组被更新过了）。
+    """
+    ver, sig = _override_parts(rec)
+    if not ver:
+        return "", sig, "空记录"
+    if not sig:
+        return ver, sig, "旧格式，没有内容签名 —— 先沿用，界面上标出来待核对"
+    # ★ fresh=True：这里是在判断"内容到底变没变"，**不能**用缓存 ——
+    #   判错的后果就是"手动值永远不失效"，等于没修（issue #1 的坑）。
+    now = content_sig(path, fresh=True)
+    if not now:
+        # 目录读不到（不存在/无权限）—— 判不了，按"仍然可用"处理，
+        # 宁可暂时用旧值，也不要在读不到目录时把用户填的值丢掉。
+        return ver, sig, "目录读不到，暂时沿用手动值"
+    if now == sig:
+        return ver, sig, "内容没变，手动值仍然成立"
+    return "", sig, "内容变了（模组被更新过），手动值已自动失效"
+
+
+def read_version_overrides() -> dict:
+    """读 config.json 里的 version_overrides（原始记录，未解析）。"""
+    return (read_config().get("version_overrides") or {})
+
+
+def _pick_local_version(entry: dict, imported: str) -> str:
+    """在没有导入记录时，从「目录名」和「元数据」两处证据里挑一个。
+
+    ★ 为什么需要挑（issue #1，用户 2026-10-12 实测）：
+      导入更新版会**复用旧目录**，文件夹名里那个版本号是永久旧值
+      （"Vanilla-Plus-Megapack-v40_AR205686" 里装着 v41 的内容），
+      而 `guess_version` 原本优先读目录名 → 永远报「有更新」。
+      用户的实测：HD2Runtime（目录名 0.30.3 / 元数据 0.31.3）、
+      Vanilla Plus Megapack（目录名 40 / 元数据 megapack-v41）都这样。
+
+    ★ 为什么不能简单改成"元数据优先"（实测 21 个模组后的结论）：
+      两种证据各有准的时候 —— 有的 mod 元数据反而更旧（实测 5 个，例如
+      HD2 C4 Quick Actions 目录名 1.13.1 反而比元数据的 2.2 更可信）。
+      所以规则是：**能比大小就取更新的那个；比不了（格式不同 / 缺一方）
+      就退回目录名**（它至少是 Arsenal 自己装的、能对上 N 网命名）。
+
+    顺序：导入时记下的版本（最硬） > 这一段的挑选 > 目录名 > 元数据。
+    """
+    if imported:
+        return imported
+    from .util import compare as _cmp
+
+    by_dir = guess_version(entry) or ""
+    by_meta = read_version_from_metadata(entry) or ""
+    if by_dir and by_meta and by_dir != by_meta:
+        try:
+            # compare(a, b) == "newer" 的意思是「**b 比 a 新**」。
+            # 这里 a=by_dir、b=by_meta，所以：
+            #   "newer" → 元数据更新 → 用元数据（目录名是旧目录留下的）
+            #   "older" → 目录名更新 → 用目录名
+            _rel = _cmp(by_dir, by_meta)
+            # ★ 防呆：目录名里被截出来的**单段**数字（如 `1`）经常只是
+            #   版本号的第一段，而不是真的版本号（实测「机甲部位血量HUD v1.11.1」
+            #   的目录名只解析出 `1`，而 label/元数据都指向 1.11.1）。
+            #   拿 "1" 和 "1.11.1" 比大小会判"元数据更新"，但这里真正的版本号
+            #   是 `1.11.1`。**出现这种情况就信多段的那个**（更完整）。
+            _d_parts = by_dir.replace(".", "").isdigit() and len(by_dir.split("."))
+            _m_parts = by_meta.replace(".", "").isdigit() and len(by_meta.split("."))
+            if _d_parts == 1 and _m_parts and _m_parts > 1:
+                return by_meta
+            if _rel == "newer":
+                return by_meta
+            if _rel == "older":
+                return by_dir
+        except Exception:  # noqa: BLE001
+            pass
+    return by_dir or by_meta
+
+
+def read_installed_versions() -> dict:
+    """读「导入时记下的本地版本」。
+
+    ★ 这份记录解决的是另一个问题（issue #1 用户 2026-12-12 实测发现）：
+      导入更新版时 `import_zip` 会**复用旧目录**，所以文件夹名里那个
+      版本号永远停在旧值（"Vanilla-Plus-Megapack-v40" 里装着 v41 的内容），
+      而 `guess_version` 又优先读目录名 → 于是永远报「有更新」。
+      **导入那一刻我们确切知道装的是哪个版本**，把它连同内容签名记下来，
+      比事后从目录名/元数据里猜可靠得多。
+    """
+    return (read_config().get("installed_versions") or {})
+
+
+def _resolve_installed(rec, path: str) -> str:
+    """「导入时记下的版本」现在还成不成立？成立就返回它，否则返回空。
+
+    和手动版本同一套判据（按内容签名核对）：内容又变了 → 这条也失效。
+    """
+    if rec is None:
+        return ""
+    ver, sig = _override_parts(rec)
+    if not ver or not sig:
+        return ver
+    now = content_sig(path, fresh=True)
+    return ver if (now and now == sig) else ""
+
+
+def set_installed_version(uuid: str, version: str, sig: str) -> None:
+    """记下「这个 uuid 当前装的是 <version>」（导入时调用）。
+
+    带内容签名 —— 内容再变一次（用户又更新了）这条记录自动失效，
+    避免变成第二个"永久冻结"。
+    """
+    if not uuid or not version:
+        return
+    cfg = read_config()
+    rec = cfg.get("installed_versions") or {}
+    rec[uuid] = {"version": str(version), "sig": str(sig or "")}
+    write_config({"installed_versions": rec})
+
+
+def get_installed_version(uuid: str) -> str:
+    return _override_parts(read_installed_versions().get(uuid or ""))[0]
+
+
+def get_version_override(uuid: str) -> str:
+    """读这个模组**手动填的**本地版本（没有记录返回空串）。
+
+    注意它返回的是"记下来的那个值"，**不管它现在还有效没有** ——
+    "当前实际采用的本地版本"请用 ``load_library`` 给的
+    ``installed_version``（那里已经按内容签名核对过了）。
+    """
+    return _override_parts(read_version_overrides().get(uuid or ""))[0]
+
+
+def set_version_override(uuid: str, version: str, sig: str = "",
+                         path: str = "") -> None:
+    """记一条手动填的本地版本（**带上当前内容签名**）。
+
+    传空 ``version`` = 清除这条记录。
+
+    ``sig`` 是"填这个版本时该模组的内容签名"，**必须带上**，否则这条记录
+    会退化成"旧格式"：`_resolve_override` 对没有签名的记录一律「先沿用」，
+    将来模组更新了它也**不会自动失效** —— 那正是 issue #1 的坑。
+
+    为了少一个踩坑点：``sig`` 留空但给了 ``path`` 时**现算一次**；
+    两者都空才会真的写成旧格式记录（只用于测试 / 历史数据迁移场景）。
+
+    ★ 2026-10-12 修正：原实现的 docstring 写着"留空就现场算一次"，
+    但代码只是 ``sig or ""`` —— 文档与行为不符，等于留了个"静默造出
+    永久冻结记录"的口子（新加的测试正是这样把它照出来的）。
+    """
+    cfg = read_config()
+    ov = cfg.get("version_overrides") or {}
+    if uuid:
+        if version:
+            if not sig and path:
+                try:
+                    sig = content_sig(path, fresh=True)
+                except Exception:  # noqa: BLE001
+                    sig = ""
+            ov[uuid] = {"version": str(version), "sig": sig or ""}
+        else:
+            ov.pop(uuid, None)
+        write_config({"version_overrides": ov})
+
+
+def clear_version_override(uuid: str) -> bool:
+    """清掉这一条手动版本（= 用户主动选择"恢复自动探测"）。返回是否真清掉了。"""
+    cfg = read_config()
+    ov = cfg.get("version_overrides") or {}
+    if uuid in ov:
+        ov.pop(uuid, None)
+        write_config({"version_overrides": ov})
+        return True
+    return False
+
+
+def heal_legacy_overrides(entries) -> int:
+    """存量自愈：清掉「旧格式、且当前不产生任何影响」的手动版本记录。
+
+    为什么需要（issue #1 评估，2026-10-12）：
+      v1.8.11 及更早写下的手动版本**没有内容签名**，而 `_resolve_override`
+      对没有签名的记录是「先沿用」（有意保留用户数据）—— 于是"不冻结"机制
+      对它们**完全不生效**。后果：升级到修复版之后，这些记录照旧永久生效，
+      反馈者那 16 条里 2 条现在就在误报、其余 14 条一更新模组就变成误报。
+      而让用户自己逐条右键去清，16 条 ≈ 48 次点击，且 GUI 里没有批量入口。
+
+    本函数只清**可证明无副作用**的那一类：``手动值 == 自动探测值``。
+      有它没它，工具采用的本地版本**完全一样**，判定也一样 ——
+      所以清掉它不改变任何结论，只是把一条"看起来是用户设的、
+      实际什么都不影响"的噪音记录删掉（这类正是「指定来源」当年无条件
+      写入 override 留下的历史包袱）。
+
+    ★ 刻意**不**清的两种情况（都得由用户自己决定）：
+      · 手动值 != 自动探测值 → 有实际影响，界面标出来让用户核对；
+      · 自动探测值为空 → 清掉会把「有版本可比」变成「版本存疑」，那是有害的
+        （实测反馈者的 Mine Flags (AiO) 就是这种：目录名解析不出版本，
+         那条手动值 `1.0` 反而是**唯一**能比大小的依据）。
+
+    返回清掉几条。调用方负责记日志 / 提示用户。
+    """
+    doomed: list[str] = []
+    for e in entries or ():
+        if not e.get("override_legacy"):
+            continue
+        manual = str(e.get("manual_version") or "").strip()
+        auto = str(e.get("auto_version") or "").strip()
+        # ★ 两个条件缺一不可：值相同 **且** 自动值非空。
+        if manual and auto and manual == auto:
+            u = str(e.get("uuid") or "")
+            if u:
+                doomed.append(u)
+    if not doomed:
+        return 0
+    cfg = read_config()
+    ov = cfg.get("version_overrides") or {}
+    cleaned = 0
+    for u in doomed:
+        if u in ov:
+            ov.pop(u, None)
+            cleaned += 1
+    if cleaned:
+        write_config({"version_overrides": ov})
+    return cleaned
+
+
+def prune_version_overrides(valid_uuids) -> int:
+    """删掉**已经不在库里**的孤儿记录（模组被删了 / 换了 uuid）。
+
+    没有这个清理，孤儿记录会永远躺在 config.json 里：用户早就忘了填过，
+    模组也不在了，配置却还在慢慢变大。返回删掉几条。
+    """
+    valid = set(valid_uuids or ())
+    cfg = read_config()
+    ov = cfg.get("version_overrides") or {}
+    if not ov:
+        return 0
+    gone = [k for k in ov if k not in valid]
+    for k in gone:
+        ov.pop(k, None)
+    if gone:
+        write_config({"version_overrides": ov})
+    return len(gone)
 
 
 def candidate_data_files() -> list[str]:
@@ -207,8 +558,14 @@ def load_library(data_file: str) -> list[dict]:
     # （modsLibrary 是"库"，没有这些标志 —— 早期版本误从它读，导致 enabled/deployed
     #   恒为 False。这里改成按 uuid 从配置档反查。）
     deploy = _deployment_map(data)
-    # 用户手动修正过的本地版本（按 uuid 记），优先于自动推断
+    # 用户手动修正过的本地版本（按 uuid 记）。
+    # ★ 不是"无条件优先" —— 会先按内容签名核对，见 _resolve_override。
     overrides = (read_config().get("version_overrides") or {})
+    # 「导入时记下的本地版本」—— 导入那一刻确切知道的版本 + 当时的内容签名。
+    # ★ 排在目录名之前：导入新版会复用旧目录，目录名里那个版本号是永久旧值
+    #   （issue #1 用户实测：目录名 "Vanilla-Plus-Megapack-v40" 装着 v41 的内容）。
+    installed_recs = (read_config().get("installed_versions") or {})
+    lib: list[dict] = []
     lib: list[dict] = []
     for m in data.get("modsLibrary") or []:
         path = m.get("path") or ""
@@ -236,37 +593,52 @@ def load_library(data_file: str) -> list[dict]:
             # 选项配置：部署时要用它过滤掉用户禁用的选项（include 名 = 子目录名）
             "options": m.get("options") or [],
         }
+        _imported = _resolve_installed(installed_recs.get(entry["uuid"]),
+                                      entry.get("path") or "")
+        entry["imported_version"] = _imported
         auto = (
             entry["nexus_version"]
-            or guess_version(entry)
-            or read_version_from_metadata(entry)
+            or _pick_local_version(entry, _imported)
             or ""
         )
         entry["auto_version"] = auto
         # 「装的是哪个变体」—— 多变体 mod（如 Megapack 的 Rows 版）靠它挑对文件
         entry["variant"] = local_variant(entry)
-        if entry["uuid"] in overrides:
-            entry["installed_version"] = str(overrides[entry["uuid"]])
-            entry["version_is_manual"] = True
+        # 「手动填的版本」—— ★ 不再无条件优先，见 _resolve_override 的说明：
+        #   内容没变就沿用；内容变了（模组被更新过）就自动失效、回到 auto。
+        rec = overrides.get(entry["uuid"])
+        if rec is not None:
+            use, sig, why = _resolve_override(rec, entry.get("path") or "")
+            entry["manual_version"] = _override_parts(rec)[0]
+            entry["manual_sig"] = sig
+            entry["manual_state"] = why
+            # 「旧格式记录」= 没有内容签名的那种（v1.8.11 及更早写的）。
+            #   ★ 标出来是给存量自愈看的（`heal_legacy_overrides`）：这类记录
+            #   绕过了"不冻结"机制，只有它能被安全清理；新格式一律不动。
+            entry["override_legacy"] = not sig
+            if use:
+                entry["installed_version"] = use
+                entry["version_is_manual"] = True
+                entry["override_why"] = why
+                entry["override_stale"] = False
+            else:
+                # 自动失效：本地版本改用自动探测值，并把"你填的旧值"留在旁边，
+                # 供界面如实说明"你填的 X 已失效，现在按自动探测的 Y 判断"。
+                entry["installed_version"] = auto
+                entry["version_is_manual"] = False
+                entry["override_why"] = why
+                entry["override_stale"] = True
         else:
             entry["installed_version"] = auto
             entry["version_is_manual"] = False
+            entry["manual_version"] = ""
+            entry["manual_sig"] = ""
+            entry["manual_state"] = ""
+            entry["override_why"] = ""
+            entry["override_stale"] = False
+            entry["override_legacy"] = False
         lib.append(entry)
     return lib
-
-
-def set_version_override(uuid: str, version: str) -> None:
-    cfg = read_config()
-    ov = cfg.get("version_overrides") or {}
-    if version:
-        ov[uuid] = version
-    else:
-        ov.pop(uuid, None)
-    write_config({"version_overrides": ov})
-
-
-def get_version_override(uuid: str) -> str:
-    return str((read_config().get("version_overrides") or {}).get(uuid) or "")
 
 
 # Nexus 给下载目录起的名字末尾固定是

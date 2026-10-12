@@ -469,12 +469,24 @@ def library_overview() -> dict:
             ms = arsenal.read_manifest_sources(e)
         except Exception:  # noqa: BLE001
             ms = []
+        # ★ 版本来源要说清是哪一种（issue #1：反馈者就是靠「手动填的」这五个字
+        #   发现自己 30 个模组里 17 个被冻住）。三种：
+        #     手动填的（还在生效） / 自动猜的 / 手动填的·已失效（内容变过了）
+        if e.get("override_stale"):
+            vsrc = f"手动填的，但**已自动失效**（你填的 {e.get('manual_version') or '?'}）"
+        elif e.get("version_is_manual"):
+            vsrc = "手动填的" + (
+                "（还没核对过内容）" if "旧格式" in str(e.get("manual_state") or "")
+                else "")
+        else:
+            vsrc = "自动猜的"
         rows.append({
             "label": e.get("label") or "（没有名字）",
             "dirname": e.get("dirname") or "",
             "uuid": e.get("uuid") or "",
             "version": e.get("installed_version") or "",
-            "version_src": "手动填的" if e.get("version_is_manual") else "自动猜的",
+            "auto_version": e.get("auto_version") or "",
+            "version_src": vsrc,
             "variant": e.get("variant") or "",
             "nexus_id": e.get("nexus_mod_id") or "",
             "enabled": bool(e.get("enabled")),
@@ -640,9 +652,16 @@ def _fmt_library(lib: dict, with_list: bool) -> list[str]:
             flags.append(f"N网{r['nexus_id']}")
         if r["manifest"]:
             flags.append(f"manifest[{r['manifest']}]")
+        # ★ 「自动探测到」的值和实际采用的值分开写 —— issue #1 反馈者的诊断里
+        #   就是这两列并排才看出矛盾（手动 1.1 vs 目录名 1.2）。这里同理。
+        extra_ver = ""
+        av = r.get("auto_version") or ""
+        if av and av != (r.get("version") or ""):
+            extra_ver = f" | 自动探测到 {av}"
         lines.append(
             f"  · {r['label']} | 版本 {r['version'] or '未知'}"
             f"（{r['version_src']}）"
+            + extra_ver
             + (f" | 变体 {r['variant']}" if r["variant"] else "")
             + f" | 目录名 {r['dirname'] or '?'}"
             + (f" | uuid {r['uuid'][:8]}" if r["uuid"] else "")

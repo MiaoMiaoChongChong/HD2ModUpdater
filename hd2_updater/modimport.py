@@ -454,9 +454,44 @@ def import_zip(data_file: str, zip_path: str, mods_dir: str | None = None,
         # （查不到就留空，不影响识别 —— 目录名里那串 N 网命名还在）
         nexus_data = build_nexus_data(info, api_key)
 
+        # ★★★ 查不到时**不能写 None**：库里原来那条可能是 Arsenal 自己写的
+        #   （有 modId / fileId / version，是它自己更新检查的依据）。
+        #   `upsert_library_mod` 是 `lib[idx] = shaped` **整条替换**，
+        #   以前这里写 None 就等于把 Arsenal 的记录抹掉了 —— 实测本地版本从
+        #   「12」变成空，只能靠旧目录名猜，于是"刚装完新版仍说有更新"。
+        #   现在：只把**这次确实查到的**字段覆盖上去，其余保留原来的。
+        #   （这样既不丢 Arsenal 的信息，也不会把旧 version 当成新版本用
+        #     —— version 一律用这次的，fileId/updateTimestamp 查不到就沿用。）
+        if not nexus_data and existing and isinstance(existing.get("nexusData"), dict):
+            old_nd = existing["nexusData"]
+            if old_nd.get("modId"):
+                new_ver = str((info.get("nexus") or {}).get("version") or "")
+                merged = dict(old_nd)
+                if new_ver:
+                    merged["version"] = new_ver      # ★ 只更新版本号
+                merged.setdefault("fileId", old_nd.get("fileId") or "")
+                nexus_data = merged
+                info["nexus_lookup_why"] = (
+                    info.get("nexus_lookup_why", "") or "") + (
+                        "（没查到 fileId，沿用了库里原有的 nexusData）")
+
         # ★ 条目必须在**内容就位之后**构造 —— contentHash 要读真实文件，
         #   iconPath 也要确认真有这张图（早先在 staging 里算，两个都会落空）。
         entry = build_entry(info, final_dir, nexus_data)
+
+        # ★★★ 记下「现在装的是哪个版本」—— 导入这一刻我们确切知道。
+        #
+        #   为什么必须记（issue #1，用户 2026-10-12 实测）：
+        #   导入新版会**复用旧目录**（final_dir = reuse，为了不删用户数据），
+        #   所以文件夹名里那个版本号是**永久的旧值** ——
+        #   "Vanilla-Plus-Megapack-v40_AR205686" 里装着 v41 的内容，
+        #   而 guess_version 优先读目录名 → 于是永远报「有更新」。
+        #   事后从目录名/元数据里猜都不可靠（实测 5 个模组上元数据反而更旧），
+        #   **导入这一刻的版本号才是硬证据**。
+        #
+        #   连同内容签名一起记：用户之后再更新一次，这条会自动失效，
+        #   不会变成第二个"永久冻结"。
+        _remember_installed_version(info, final_dir, nexus_data)
 
         # 写库（备份 + 原子写 + 结构校验都在里面）
         try:
@@ -482,6 +517,44 @@ def import_zip(data_file: str, zip_path: str, mods_dir: str | None = None,
     finally:
         if os.path.isdir(stage):
             shutil.rmtree(stage, ignore_errors=True)
+
+
+def _remember_installed_version(info: dict, mod_dir: str,
+                                nexus_data: dict | None) -> str:
+    """导入后把「这个模组现在装的是哪个版本」记下来（记进本工具的配置）。
+
+    取版本号的顺序（越靠前越可信）：
+      1. N 网命名里那一段（`名字 16493 41 2026-…` → 41）—— 最可靠
+      2. zip 文件名里的版本号（`Vanilla-Plus-Megapack-v41.zip` → 41）
+      3. nexusData.version（刚从 N 网查到时）
+
+    解析不出来就**不记**（宁可不记，也不要记一个错的版本号 —— 那比
+    "没记录"更糟：它会变成一个看起来很确定、实际错误的值）。
+    """
+    from . import arsenal as Ar
+
+    ver = ""
+    nx = info.get("nexus") or {}
+    if nx.get("version"):
+        ver = str(nx["version"]).strip()
+    if not ver:
+        # 用 guess_version 那套正则去读 zip 文件名
+        try:
+            stem = os.path.splitext(os.path.basename(info.get("zip") or ""))[0]
+            probe = {"dirname": stem, "path": "", "nexus_version": ""}
+            ver = (Ar.guess_version(probe) or "").strip()
+        except Exception:  # noqa: BLE001
+            ver = ""
+    if not ver and nexus_data:
+        ver = str(nexus_data.get("version") or "").strip()
+    if not ver:
+        return ""
+    try:
+        Ar.set_installed_version(info["uuid"], ver,
+                                 Ar.content_sig(mod_dir, fresh=True))
+    except Exception:  # noqa: BLE001
+        return ""
+    return ver
 
 
 def _extract(info: dict, dest: str) -> None:

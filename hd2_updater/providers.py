@@ -104,6 +104,42 @@ def unescape_html(text: str) -> str:
     return _html.unescape(str(text or ""))
 
 
+# --------------------------------------------------------------------------
+# 失败原因的结构化分类
+# --------------------------------------------------------------------------
+# ★ 为什么要有这个（2026-10-12，用户报的 bug）：
+#   以前下游（gui._error_note / engine.evaluate）靠**在错误文案里找子串**来判断
+#   是哪一类失败。结果：
+#     · provider 写的是「这个 mod 被**隐藏/删除**，或你的 key 无权访问」，
+#       而下游找的子串是 `被删除` —— 对不上 → 那条分支**永远不生效**；
+#       继续往下落到 `"key" in 文案` → 把"这个 mod 已经没了"显示成
+#       **「需要 API key」**（用户明明填了 key，只会去设置页反复确认）。
+#     · 上游以后改一个字（比如"已删除"→"下架"），下游会**静默失效**。
+#   所以改成：**失败原因由产生它的地方打上结构化标签**，下游只认这个标签，
+#   不再匹配文案。文案怎么改都不会再影响分类。
+#
+# 取值（下游按键分流，"用户下一步该干什么"排序）：
+#   "gone"      这个 mod 没了 / 页面不存在了 → 换来源，别再查这个页面
+#   "site"      站点不让查（Cloudflare 硬封锁等）→ 换节点 / 过会儿再试
+#   "net"       网络层问题（超时 / 连不上）→ 过会儿再试
+#   "rate"      被限流（429）→ 过会儿再试
+#   "no_key"    用户没填凭据 → 去设置里填
+#   "bad_key"   凭据无效 / 过期 → 去设置里换一个
+#   "noperm"    有凭据但没权限看这个内容 → 多半是 mod 被隐藏/删除
+#   "shape"     能连上但内容读不出来（站点改版 / 结构变了）→ 报给作者
+#   "other"     其他
+ERR_KINDS = ("gone", "site", "net", "rate", "no_key", "bad_key", "noperm",
+             "shape", "other")
+
+
+def _err(out: dict, kind: str, msg: str) -> dict:
+    """给一个结果打上失败原因（kind 给程序判断，msg 给用户看）。"""
+    out["ok"] = False
+    out["err_kind"] = kind
+    out["error"] = msg
+    return out
+
+
 def _empty(provider: str) -> dict:
     return {
         "provider": provider,
@@ -118,8 +154,59 @@ def _empty(provider: str) -> dict:
         "updated": "",
         "prerelease": False,
         "error": "",
+        # 失败原因的结构化分类（下游靠它分流，**不要**再去匹配 error 文案）
+        "err_kind": "",
         "note": "",
     }
+
+
+def kind_of_http(code: int, body: str = "") -> str:
+    """HTTP 状态码 + 响应体 → err_kind。
+
+    ★ 关键事实（2026-10-12 带真实 key 实测 N 网）：
+      · 已删除 / 下架的 mod → **403**，响应体 ``{"message":"Mod not available: N"}``
+      · 编号不存在        → **404**，响应体 ``{"message":"No Mod Found: N"}``
+      · 没带 key          → **401**，``{"message":"Please provide an authentication method"}``
+    所以**光看状态码分不出"这个 mod 没了"和"你没权限"** —— 403 两种都可能，
+    必须结合响应体。NetError 里带的 body 正好够用。
+    """
+    low = str(body or "").lower()
+    if code == 404 or "no mod found" in low or "not found" in low:
+        return "gone"
+    if code == 403:
+        # 明确的"mod 不存在/不可用" → gone；其余 403 归"没权限/被隐藏"
+        if "mod not available" in low or "mod not found" in low:
+            return "gone"
+        if is_cf_block(body):
+            return "site"
+        return "noperm"
+    if code == 401:
+        return "no_key"          # 对 N 网 API 来说 401 = 没给凭据
+    if code == 429:
+        return "rate"
+    if code in (502, 503, 504, 522, 525):
+        return "net"
+    if code == 418 or code == 402:
+        return "other"
+    if code and code >= 500:
+        return "net"
+    return "other"
+
+
+def kind_of_net_error(msg: str) -> str:
+    """把 ``NetError`` 的文本翻成 err_kind（这里是**唯一**允许匹配文案的地方，
+    而且只在"底层网络异常 → 分类"这一层，不跨模块传播）。"""
+    s = str(msg or "")
+    low = s.lower()
+    if "超时" in s or "timed out" in low or "timeout" in low:
+        return "net"
+    if "不可达" in s or "无法连接" in s or "connection" in low:
+        return "net"
+    if "限流" in s or "429" in s:
+        return "rate"
+    if "cloudflare" in low or is_cf_block(s):
+        return "site"
+    return "other"
 
 
 # --------------------------------------------------------------------------
@@ -160,8 +247,8 @@ def github_check(repo: str, token: str = "", asset_glob: str = "",
     if m:
         repo = m.group(1)
     if not repo or "/" not in repo:
-        out["error"] = f"仓库名不对：{repo or '(空)'}（应形如 作者/仓库）"
-        return out
+        return _err(out, "other",
+                    f"仓库名不对：{repo or '(空)'}（应形如 作者/仓库）")
     repo = repo.removesuffix(".git")
     out["url"] = f"https://github.com/{repo}"
 
@@ -177,21 +264,17 @@ def github_check(repo: str, token: str = "", asset_glob: str = "",
             # 退到 atom（不占配额，但没有资产列表）
             return _github_via_atom(repo, out, note="REST 配额受限，改用 atom 源")
         if "404" in msg:
-            out["error"] = "该仓库没有任何 release"
-            return out
-        out["error"] = friendly_error(msg)
-        return out
+            return _err(out, "gone", f"GitHub 上没有这个仓库/发布（{repo}）")
+        return _err(out, kind_of_net_error(msg) if "超时" in msg else "other",
+                    friendly_error(msg))
     except Exception as e:  # noqa: BLE001
-        out["error"] = f"意外错误：{short_err(e)}"
-        return out
+        return _err(out, "other", f"意外错误：{short_err(e)}")
 
     if not isinstance(rels, list):
-        out["error"] = "GitHub 返回了意外的数据"
-        return out
+        return _err(out, "shape", "GitHub 返回了意外的数据")
     rels = [r for r in rels if isinstance(r, dict) and not r.get("draft")]
     if not rels:
-        out["error"] = "该仓库没有任何 release"
-        return out
+        return _err(out, "gone", "该仓库没有任何 release")
     # GitHub 已按发布时间倒序返回 → 第一项就是最新
     stable = [r for r in rels if not r.get("prerelease")]
     if stable:
@@ -418,12 +501,10 @@ def _github_via_atom(repo: str, out: dict, note: str = "") -> dict:
             f"https://github.com/{repo}/releases.atom", accept="application/atom+xml"
         )
     except NetError as e:
-        out["error"] = friendly_error(str(e))
-        return out
+        return _err(out, kind_of_net_error(str(e)), friendly_error(str(e)))
     entries = re.findall(r"<entry>(.*?)</entry>", atom, re.S)
     if not entries:
-        out["error"] = "atom 源里没有 release 条目"
-        return out
+        return _err(out, "gone", "这个仓库没有任何 release（atom 源是空的）")
     first = entries[0]
     t = re.search(r"<title[^>]*>(.*?)</title>", first, re.S)
     u = re.search(r"<updated>(.*?)</updated>", first, re.S)
@@ -581,12 +662,12 @@ def nexus_check(mod_id: str, api_key: str, variant: str = "") -> dict:
     mod_id = str(mod_id or "").strip()
     out["url"] = f"https://www.nexusmods.com/helldivers2/mods/{mod_id}"
     if not mod_id.isdigit():
-        out["error"] = f"Nexus mod id 不是数字：{mod_id or '(空)'}"
-        return out
+        return _err(out, "gone",
+                    f"Nexus mod id 不是数字：{mod_id or '(空)'}")
     if not api_key:
-        out["error"] = "没填 Nexus API key"
-        out["note"] = "在设置里填一个个人 API key 就能自动查 Nexus"
-        return out
+        r = _err(out, "no_key", "没填 Nexus API key")
+        r["note"] = "在设置里填一个个人 API key 就能自动查 Nexus"
+        return r
 
     try:
         data = http_get_json(
@@ -595,24 +676,33 @@ def nexus_check(mod_id: str, api_key: str, variant: str = "") -> dict:
         )
     except NetError as e:
         msg = str(e)
-        if "401" in msg:
-            out["error"] = "API key 无效或已过期"
-        elif "403" in msg:
-            out["error"] = "这个 mod 被隐藏/删除，或你的 key 无权访问"
-        elif "404" in msg:
-            out["error"] = f"Nexus 上没有这个 mod（#{mod_id}）"
-        else:
-            out["error"] = friendly_error(msg)
-        return out
+        # ★ 分类交给 kind_of_http —— 它**看响应体**，因为 N 网对"已删除的 mod"
+        #   返回的是 **403 `Mod not available`**，和"你没权限"同一个状态码。
+        #   以前这里把 403 一律说成"被隐藏/删除**或**你的 key 无权访问"，
+        #   两种含义混在一句里，下游再也分不开（issue：反馈说成"没填 key"）。
+        m = re.search(r"HTTP (\d{3})", msg)
+        code = int(m.group(1)) if m else 0
+        kind = kind_of_http(code, msg) if code else kind_of_net_error(msg)
+        if kind == "gone":
+            return _err(out, "gone",
+                        f"这个 mod 在 Nexus 上已经没有了（#{mod_id}）——"
+                        "多半是作者删了或下架了")
+        if kind == "noperm":
+            return _err(out, "noperm",
+                        f"看不到这个 mod（#{mod_id}）——它被隐藏/删除了，"
+                        "或者你的 API key 没权限看它")
+        if kind == "no_key":
+            # 带了 key 还 401 → 是 key 本身无效（不是"没填"）
+            return _err(out, "bad_key", "API key 无效或已过期")
+        return _err(out, kind, friendly_error(msg))
 
     if not isinstance(data, dict):
-        out["error"] = "Nexus 返回了意外的数据"
-        return out
+        return _err(out, "shape", "Nexus 返回了意外的数据")
 
     files = data.get("files") or []
     if not files:
-        out["error"] = "该 mod 没有文件记录"
-        return out
+        # 200 说明页面还在（mod 没被删），只是没有任何文件 —— 别误报成"已删除"
+        return _err(out, "other", "这个 mod 在 Nexus 上没有任何文件记录")
 
     # 挑哪个文件：**先认变体，再认新旧**
     #
@@ -857,19 +947,18 @@ def ayaka_check(slug_or_url: str) -> dict:
     out = _empty("ayaka")
     raw = (slug_or_url or "").strip()
     if not raw:
-        out["error"] = "没给 ayakamods 地址"
-        return out
+        return _err(out, "other", "没给 ayakamods 地址")
     slug = ayaka_slug(raw)
     if not slug:
         out["url"] = raw
-        out["error"] = ("这个地址里没看出模组编号。请粘模组页面的地址"
-                        "（形如 ayakamods.com/mods/名字.数字/）。")
-        return out
+        return _err(out, "other",
+                    "这个地址里没看出模组编号。请粘模组页面的地址"
+                    "（形如 ayakamods.com/mods/名字.数字/）。")
     if ayaka_is_reserved(slug):
         out["url"] = raw
-        out["error"] = ("这是 ayakamods 的列表页/功能页地址，不是某个模组的页面。"
-                        "请先打开那个模组，再复制它的地址。")
-        return out
+        return _err(out, "other",
+                    "这是 ayakamods 的列表页/功能页地址，不是某个模组的页面。"
+                    "请先打开那个模组，再复制它的地址。")
     slug = ayaka_encode(slug)
     url = ayaka_url(slug)
     out["url"] = url
@@ -878,24 +967,22 @@ def ayaka_check(slug_or_url: str) -> dict:
     try:
         html = http_get(url, accept="text/html")
     except NetError as e:
-        out["error"] = friendly_error(str(e))
-        return out
+        return _err(out, kind_of_net_error(str(e)), friendly_error(str(e)))
 
     # 被 Cloudflare 挡住时页面会明显不同。
     # ★ 2026-10-11 实测补全：以前只认 "Just a moment"，但站点对本机出口回的是
     #   "Attention Required! / you have been blocked"（IP 级硬封锁）——
     #   那种响应会掉进下面的解析逻辑，最后报一个含糊的错，用户不知道该干嘛。
     if is_cf_block(html):
-        out["error"] = (
-            "ayakamods 把这个请求挡在了门外（Cloudflare）—— 不是你的网络断了。\n"
-            "实测这种封锁连真实浏览器都可能过不去，通常是站点不接受当前"
-            "出口 IP 的自动请求。\n"
-            "可以试：① 换一个代理节点 / 关掉代理再试；② 过一会儿再试；"
-            "③ 直接到浏览器打开这个页面看版本，再用「指定来源…」手工填。")
-        return out
+        return _err(out, "site",
+                    "ayakamods 把这个请求挡在了门外（Cloudflare）——"
+                    "不是你的网络断了。\n"
+                    "实测这种封锁连真实浏览器都可能过不去，通常是站点不接受当前"
+                    "出口 IP 的自动请求。\n"
+                    "可以试：① 换一个代理节点 / 关掉代理再试；② 过一会儿再试；"
+                    "③ 直接到浏览器打开这个页面看版本，再用「指定来源…」手工填。")
     if re.search(r"page cannot be found|This mod.*can'?t be found", html, re.I):
-        out["error"] = "该页面不存在（mod 可能被删除或改名）"
-        return out
+        return _err(out, "gone", "该页面不存在（mod 可能被删除或改名）")
 
     def field(*patterns: str) -> str:
         for p in patterns:
@@ -938,8 +1025,8 @@ def ayaka_check(slug_or_url: str) -> dict:
         out["file_url"] = f"{AYAKA_BASE}/mods/{slug}/download"
 
     if not version and not updated:
-        out["error"] = "页面结构变了，没读到版本信息（站点可能改版）"
-        return out
+        return _err(out, "shape",
+                    "页面结构变了，没读到版本信息（站点可能改版）")
     out["ok"] = True
     return out
 
