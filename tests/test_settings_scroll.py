@@ -11,7 +11,9 @@
 """
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -19,6 +21,18 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 os.environ["HD2U_NO_DIALOG"] = "1"
 os.environ["HD2U_READONLY_GUARD"] = "1"
+
+# ★ 本测试一律跑在**自己的临时数据目录**上，绝不读写用户真实 config.json。
+#   起因（2026-10-18）：这里有一条断言要求"探 N 网时带上用户的 key"，
+#   以前它读的是**用户真实的配置** —— 用户没填 key 时测试就红，更糟的是
+#   这套测试曾和另一个界面实例同时写真实 config，把用户的 key 冲掉了。
+#   现在自己造一个假 key，断言稳定，也不碰用户数据。
+_TMP = os.path.join(HERE, "_tmp_settings_data")
+shutil.rmtree(_TMP, ignore_errors=True)
+os.makedirs(_TMP, exist_ok=True)
+os.environ["HD2U_DATA_DIR"] = _TMP
+with open(os.path.join(_TMP, "config.json"), "w", encoding="utf-8") as _f:
+    json.dump({"nexus_api_key": "TEST_KEY_DUMMY", "github_token": ""}, _f)
 
 PASS = 0
 FAIL = 0

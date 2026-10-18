@@ -10,16 +10,72 @@ Arsenal 的数据位置（按优先级）：
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import re
 import glob
+import time
 
 from .util import app_data_dir
 
 ARSENAL_DIRNAME = "hd2arsenal"
 DATA_FILENAME = "hd2a_data.json"
+
+# 最近一次读 config.json 的失败原因（空 = 读成功 / 文件不存在）。
+# write_config 靠它判断"这次读到的是空壳，不能拿去覆盖磁盘"。
+_cfg_last_error = ""
+
+# 上一次 write_config 把旧配置留档到了哪里（空 = 没留档）
+_cfg_backed_up = ""
+
+
+@contextlib.contextmanager
+def _config_lock(timeout: float = 3.0):
+    """跨进程互斥：同一时刻只允许一个进程对 config.json 做"读-改-写"。
+
+    为什么需要（2026-10-18 事故的最后一环）：**原子写只解决"读到半个文件"**，
+    不解决"后写的盖掉先写的" —— 两个实例同时读、各自改、再各自写，
+    后写的那个就把前一个刚存的字段盖没了（两个窗口同时开着就够触发）。
+    这里用 Windows 的文件锁把这段串成队；进程退出时系统自动释放锁，
+    不会像 `O_EXCL` 那种自造锁一样留下"死锁文件"。
+
+    拿不到锁（超时 3 秒）就**照常写**：宁可偶尔丢一次更新，
+    也不能让保存按钮卡住 —— 但绝不会再出现"读空 → 整份覆盖"。
+    """
+    f = None
+    locked = False
+    try:
+        f = open(os.path.join(app_data_dir(), "config.lock"), "a+b")
+        try:
+            import msvcrt
+        except ImportError:      # 非 Windows：没有 msvcrt，退化为不锁
+            msvcrt = None
+        if msvcrt is not None:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.05)
+        yield
+    finally:
+        if f is not None:
+            if locked:
+                try:
+                    import msvcrt
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                f.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 # .patch_ 是所有 HD2 mod 的补丁文件标志（modimport 里也用同一个）
 _PATCH_MARK = ".patch_"
@@ -434,23 +490,90 @@ def _other_drives() -> list[str]:
 
 
 def read_config() -> dict:
+    """读工具自己的 config.json。
+
+    · 文件**不存在** → 返回 {}（第一次运行，正常情况）
+    · 文件存在但**读不出来**（另一个进程正在写 / 被手工改坏）→ 重试 3 次，
+      仍失败就返回 {}，并把原因记进 ``_cfg_last_error``。
+
+    ★ 为什么要这个全局标记（2026-10-18 的事故）：旧版读失败直接返回 {}，
+      然后 :func:`write_config` 拿"空 + 本次改动"整份写回磁盘 ——
+      用户填过的 N 网 key / GitHub token 就这样被**静默抹掉**了。
+      现在写盘前会先看这个标记：读到的是"空壳"时**不拿它覆盖**。
+    """
+    global _cfg_last_error
     cfg = os.path.join(app_data_dir(), "config.json")
-    try:
-        with open(cfg, encoding="utf-8-sig") as f:
-            return json.load(f) or {}
-    except Exception:  # noqa: BLE001
+    if not os.path.isfile(cfg):
+        _cfg_last_error = ""
         return {}
+    last = ""
+    for attempt in range(3):
+        try:
+            with open(cfg, encoding="utf-8-sig") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                _cfg_last_error = ""
+                return data
+            last = f"顶层不是对象（{type(data).__name__}）"
+        except Exception as e:  # noqa: BLE001
+            last = f"{type(e).__name__}: {e}"
+        if attempt < 2:
+            time.sleep(0.05 * (attempt + 1))
+    _cfg_last_error = last
+    return {}
 
 
-def write_config(patch: dict) -> None:
+def write_config(patch: dict) -> bool:
+    """把 ``patch`` 合并进 config.json —— **原子写 + 跨进程串行**，返回是否写成功。
+
+    三条保护（2026-10-18 事故之后加的，别删）：
+
+    ① **原子替换**：先写 ``config.json.tmp`` 再 ``os.replace`` ——
+       别的进程永远看不到写了一半的文件。旧版直接 ``open("w")`` 截断再写，
+       另一个进程恰好在这瞬间读，就会读到半个 JSON → 解析失败 → 当空 →
+       再整份写回，把别人的配置全抹掉（那次就是这么丢掉用户的 key 的）。
+    ② **读到空壳时不覆盖**：磁盘上已有 config.json 但这次读不出来时，
+       先把坏文件改名留档（``config.json.bad-<时间>``，路径可用
+       :func:`config_backup_path` 取到），再只写这次的改动 ——
+       即使用户的东西已经被别的原因弄丢，也能从那个 .bad 里找回来。
+    ③ **跨进程互斥**：两个实例同时"读→改→写"仍会互相盖掉对方的字段
+       （原子写只解决"读到半个文件"，不解决"后写的盖掉先写的"）。
+       这里用文件锁把这段串起来，见 :func:`_config_lock`。
+    """
+    global _cfg_backed_up
     cfg = os.path.join(app_data_dir(), "config.json")
-    cur = read_config()
-    cur.update(patch)
-    try:
-        with open(cfg, "w", encoding="utf-8") as f:
-            json.dump(cur, f, ensure_ascii=False, indent=2)
-    except Exception:  # noqa: BLE001
-        pass
+    _cfg_backed_up = ""
+    with _config_lock():
+        cur = read_config()
+        if _cfg_last_error and os.path.isfile(cfg):
+            bad = f"{cfg}.bad-{time.strftime('%Y%m%d-%H%M%S')}"
+            try:
+                os.replace(cfg, bad)
+                _cfg_backed_up = bad
+            except OSError:
+                pass
+        cur.update(patch)
+        tmp = cfg + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cur, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, cfg)
+            return True
+        except Exception:  # noqa: BLE001
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return False
+
+
+def config_backup_path() -> str:
+    """上一次 :func:`write_config` 把旧配置留档到了哪里（没留档就是空串）。
+
+    给界面用：留过档就说明"磁盘上那份配置当时读不出来"，
+    必须告诉用户一声，而不是让他以后自己发现设置怎么没了。
+    """
+    return _cfg_backed_up
 
 
 def first_mod_priority(data_file: str) -> bool:

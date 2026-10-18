@@ -30,6 +30,7 @@ ST_ERROR = "error"          # 查询失败
 ST_NO_SOURCE = "nosource"   # 查过了，但没找到来源
 ST_UNCHECKED = "unchecked"  # 还没检查（刚打开程序时的初始状态）
 ST_DOWNLOADED = "downloaded"  # 有更新，而且这个版本**已经下过了**
+ST_BLOCKED = "blocked"      # 用户主动屏蔽：不查更新、也不找来源
 
 
 def sources_path() -> str:
@@ -131,6 +132,88 @@ def restore_sources(entry: dict, items: list[dict]) -> None:
 def source_key(entry: dict) -> str:
     """给一个 mod 生成稳定 key（优先 uuid）。"""
     return entry.get("uuid") or entry.get("label") or entry.get("dirname") or ""
+
+
+# --------------------------------------------------------------- 屏蔽
+# 「屏蔽」= 这个模组**不参与自动/批量的检查更新与来源搜索**。
+# 为什么需要（用户 2026-10-18 提的）：
+#   有些模组他就是要停在旧版（或作者天天发新版但他不跟），
+#   每次「检查更新」都跳一行"有更新"，时间一长整张表全是噪音；
+#   还有些模组永远认不出来源，每次"识别来源"都白跑一遍。
+#   这些都应该能**逐个**静音，而不是把整个检查关掉。
+#
+# 存储放在**独立文件** blocked.json（不塞进 config.json）：
+#   config.json 是"全局设置"，屏蔽是"逐条模组的状态"；
+#   混在一起既不好批量清空，也容易被设置页保存时顺手写坏。
+BLOCKED_FILE = "blocked.json"
+
+
+def blocked_path() -> str:
+    return os.path.join(app_data_dir(), BLOCKED_FILE)
+
+
+def load_blocked() -> dict:
+    """读屏蔽表：``{模组 key: {"label": 名字, "at": 屏蔽时间}}``。
+
+    容错口径与 `load_sources()` 一致：文件损坏、被手工改坏、顶层不是 dict
+    一律当空 —— 屏蔽不是关键数据（丢了只是噪音重新出现），
+    但绝不能因为一个坏文件让整个界面报错。
+    """
+    try:
+        with open(blocked_path(), encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    mods = data.get("mods")
+    if not isinstance(mods, dict):
+        # 兼容"直接就是 {key: {...}}"的写法（手工编辑过也认）
+        mods = data
+    out: dict = {}
+    for k, v in mods.items():
+        if isinstance(k, str) and k:
+            out[k] = v if isinstance(v, dict) else {}
+    return out
+
+
+def save_blocked(mods: dict) -> None:
+    """原子写盘（先写 .tmp 再 os.replace）。**失败会抛异常**。
+
+    ★ 和 `arsenal.write_config()` 不同：那个是"顺手记一笔"，失败静默；
+      屏蔽是用户**明确点出来的动作** —— 写不进去必须让他知道，
+      否则他以为屏蔽好了、下次检查又冒出来，只会觉得功能是坏的。
+    """
+    p = blocked_path()
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"version": 1, "mods": mods}, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, p)
+
+
+def set_blocked(entry: dict, on: bool, label: str = "") -> bool:
+    """屏蔽 / 取消屏蔽一个模组（**立刻落盘**）。返回操作后是否处于屏蔽状态。"""
+    key = source_key(entry)
+    if not key:
+        raise ValueError("这个模组没有可用的标识（uuid 和名字都为空），没法记录屏蔽")
+    mods = load_blocked()
+    if on:
+        mods[key] = {
+            "label": label or entry.get("label") or entry.get("dirname") or key,
+            "at": now_str(),
+        }
+    else:
+        mods.pop(key, None)
+    save_blocked(mods)
+    return bool(on)
+
+
+def is_blocked(entry: dict, blocked: dict | None = None) -> bool:
+    """这个模组是否被屏蔽（``blocked`` 可传入已读好的表，免得重复读盘）。"""
+    key = source_key(entry)
+    if not key:
+        return False
+    return key in (load_blocked() if blocked is None else blocked)
 
 
 def check_one_source(src: dict, api_key: str, github_token: str,
@@ -319,6 +402,8 @@ class Engine:
         # 需要用户来选的（"确实搞不清楚"的那些）：key -> {label, reason, candidates}
         self.ambiguous: dict[str, dict] = {}
         self.results: list[dict] = []
+        # 被用户屏蔽的模组（key -> {label, at}）：**任何自动检查/搜索都跳过它们**
+        self.blocked: dict[str, dict] = load_blocked()
 
     def cancel(self) -> None:
         self._cancel.set()
@@ -352,8 +437,17 @@ class Engine:
     # ---------------------------------------------------------------- 加载
     def load(self) -> list[dict]:
         self.library = load_library(self.data_file)
-        self._log(f"从 Arsenal 读到 {len(self.library)} 个模组")
+        # 每次开跑都重读屏蔽表：用户可能刚在右键里改过，别用启动时那份旧表
+        self.blocked = load_blocked()
+        self._log(f"从 Arsenal 读到 {len(self.library)} 个模组"
+                  + (f"（其中 {len(self.blocked)} 个已屏蔽，跳过）"
+                     if self.blocked else ""))
         return self.library
+
+    def is_blocked(self, entry: dict) -> bool:
+        """这个模组是否被屏蔽（引擎内的唯一判断口径）。"""
+        key = source_key(entry)
+        return bool(key) and key in self.blocked
 
     # ------------------------------------------------------- 解析来源
     def resolve_sources(self, force_search: bool = False,
@@ -384,7 +478,9 @@ class Engine:
 
         todo = [
             e for e in self.library
-            if only_keys is None or source_key(e) in only_keys
+            if (only_keys is None or source_key(e) in only_keys)
+            # ★ 屏蔽的模组不参与来源搜索（用户右键「屏蔽这个模组的更新与查找」）
+            and not self.is_blocked(e)
         ]
 
         # GitHub 搜索并发预填：只有「真要联网搜」的模组才需要 ——
@@ -531,6 +627,9 @@ class Engine:
         jobs = []
         for entry in self.library:
             key = source_key(entry)
+            # ★ 屏蔽的模组：一个网络请求都不发（"屏蔽"就是别再去查它）
+            if self.is_blocked(entry):
+                continue
             if only_keys is not None and key not in only_keys:
                 continue
             for src in self.resolved.get(key) or []:
@@ -538,7 +637,8 @@ class Engine:
         # 被选中但没有任何来源的模组：也要给出结果（未找到来源）
         entries_to_do = [
             e for e in self.library
-            if only_keys is None or source_key(e) in only_keys
+            if not self.is_blocked(e)
+            and (only_keys is None or source_key(e) in only_keys)
         ]
 
         total = len(jobs)
@@ -643,7 +743,7 @@ class Engine:
 def summarize(results: list[dict]) -> dict:
     """统计各状态数量。"""
     n = {ST_UPDATE: 0, ST_BETA: 0, ST_OK: 0, ST_ERROR: 0, ST_UNKNOWN: 0,
-         ST_NO_SOURCE: 0, ST_DOWNLOADED: 0}
+         ST_NO_SOURCE: 0, ST_DOWNLOADED: 0, ST_BLOCKED: 0}
     for r in results:
         n[r["status"]] = n.get(r["status"], 0) + 1
     return n

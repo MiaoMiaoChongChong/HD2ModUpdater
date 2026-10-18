@@ -460,6 +460,17 @@ def library_overview() -> dict:
     out["total"] = len(lib)
     out["enabled"] = sum(1 for e in lib if e.get("enabled"))
     out["deployed"] = sum(1 for e in lib if e.get("deployed"))
+    # 被用户屏蔽的模组（不查更新、不找来源）—— 反馈里"为什么这个没检查"
+    # 十有八九就是这个原因，所以诊断里必须能看出来。
+    key_of = None
+    blocked: set = set()
+    try:
+        from . import engine as _eng
+        key_of = _eng.source_key
+        blocked = set(_eng.load_blocked())
+    except Exception:  # noqa: BLE001
+        pass
+    out["blocked"] = len(blocked)
     if lib:
         out["game_dir"] = lib[0].get("game_dir") or ""
         out["mods_dir"] = lib[0].get("mods_dir") or ""
@@ -491,6 +502,7 @@ def library_overview() -> dict:
             "nexus_id": e.get("nexus_mod_id") or "",
             "enabled": bool(e.get("enabled")),
             "deployed": bool(e.get("deployed")),
+            "blocked": bool(key_of and key_of(e) in blocked),
             "manifest": ", ".join(
                 f"{m.get('provider')}:{m.get('id') or m.get('url') or '?'}" for m in ms
             ),
@@ -635,7 +647,10 @@ def _fmt_net(net: dict | None) -> list[str]:
 def _fmt_library(lib: dict, with_list: bool) -> list[str]:
     if not lib.get("ok"):
         return [f"读模组库失败：{lib.get('error') or '未知原因'}"]
-    lines = [f"共 {lib['total']} 个模组（启用 {lib['enabled']}，已部署 {lib['deployed']}）",
+    lines = [f"共 {lib['total']} 个模组（启用 {lib['enabled']}，"
+             f"已部署 {lib['deployed']}"
+             + (f"，已屏蔽更新检查 {lib.get('blocked')}" if lib.get("blocked") else "")
+             + "）",
              f"模组目录：{lib.get('mods_dir') or '?'}",
              f"游戏目录：{lib.get('game_dir') or '?'}"]
     if not with_list:
@@ -648,6 +663,8 @@ def _fmt_library(lib: dict, with_list: bool) -> list[str]:
             flags.append("已启用")
         if r["deployed"]:
             flags.append("已部署")
+        if r.get("blocked"):
+            flags.append("已屏蔽更新检查")
         if r["nexus_id"]:
             flags.append(f"N网{r['nexus_id']}")
         if r["manifest"]:

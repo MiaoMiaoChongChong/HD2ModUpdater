@@ -43,6 +43,7 @@ from .arsenal_sync import (
 from .modimport import ModImportError, import_paths, inspect_zip, split_drop_paths
 from .engine import (
     ST_BETA,
+    ST_BLOCKED,
     ST_DOWNLOADED,
     ST_ERROR,
     ST_NO_SOURCE,
@@ -55,10 +56,12 @@ from .engine import (
     clear_auto_sources,
     clear_source,
     download,
+    load_blocked,
     load_sources,
     open_in_browser,
     restore_sources as engine_restore_sources,
     save_sources,
+    set_blocked,
     set_manual_source,
     source_key,
 )
@@ -88,6 +91,8 @@ STATUS_TEXT = {
     ST_ERROR: ("查询失败", RED),
     ST_NO_SOURCE: ("未找到来源", FG_DIM),
     ST_UNCHECKED: ("未检查", FG_DIM),
+    # 用户右键屏蔽的模组：检查更新和识别来源都会跳过它（见 engine.ST_BLOCKED）
+    ST_BLOCKED: ("已屏蔽", "#8a8577"),
 }
 PROV_NAME = {"github": "GitHub", "nexus": "N网", "ayaka": "ayakamods"}
 
@@ -778,10 +783,14 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
         # 避免又变成"两个页面都能改"。
         cols = ("status", "profile", "label", "local", "remote", "site", "note")
         self.tree = ttk.Treeview(wrap, columns=cols, show="headings", selectmode="browse")
+        # ★ 列宽合计要**装得进默认窗口（1180）**：以前合计 1126，而可用宽度约 970
+        #   —— 最后一列「说明」被窗口右边缘切掉一截，而"说明"正是这个工具讲
+        #   "为什么这样判、下一步点哪"的唯一地方（用户看不到后半句）。
+        #   现在合计 956，默认窗口下能完整显示。
         heads = {
-            "status": ("状态", 84), "profile": ("配置档", 84), "label": ("模组", 320),
-            "local": ("本地", 84), "remote": ("线上", 124), "site": ("来源", 100),
-            "note": ("说明", 330),
+            "status": ("状态", 74), "profile": ("配置档", 68), "label": ("模组", 240),
+            "local": ("本地", 78), "remote": ("线上", 108), "site": ("来源", 88),
+            "note": ("说明", 300),
         }
         for c, (t, w) in heads.items():
             self.tree.heading(c, text=t)
@@ -825,6 +834,11 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
                              command=self._ctx_undo_source)
         self.menu.add_command(label="本地版本…（查看 / 改 / 恢复自动）",
                              command=self._ctx_local_version)
+        self.menu.add_separator()
+        # 屏蔽：把这一行从「检查更新 / 识别来源」里摘出去（可逆，随时取消）
+        self.menu.add_command(label="屏蔽这个模组的更新与查找",
+                              command=self._ctx_toggle_block)
+        self._block_menu_index = self.menu.index("end")
         self.menu.add_separator()
         self.menu.add_command(label="删除这个模组…", command=self._ctx_delete_mod)
         self.menu.add_separator()
@@ -945,6 +959,97 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
         messagebox.showinfo("删除完成", "\n".join(lines),
                             parent=parent_widget or self)
         return True
+
+    # ------------------------------------------------------------ 屏蔽
+    def toggle_block(self, entry: dict, parent_widget=None) -> bool:
+        """屏蔽 / 取消屏蔽一个模组（**两个页面共用这一条路径**，行为一致）。
+
+        屏蔽的含义（用户 2026-10-18 要的）：以后「检查更新」「识别来源」
+        「下载全部」都跳过它 —— 一条网络请求都不发。
+        它**不影响** Arsenal 里的启用状态，也不影响部署（那是另一件事）。
+
+        返回操作后是否处于屏蔽状态。写盘失败会如实报错，不假装成功。
+        """
+        key = source_key(entry)
+        label = entry.get("label") or entry.get("dirname") or "(未命名)"
+        want = key not in load_blocked()
+        try:
+            on = set_blocked(entry, want, label=label)
+        except Exception as e:  # noqa: BLE001
+            error_box(
+                "没能保存屏蔽状态",
+                f"「{label}」的屏蔽状态没有写进磁盘：\n{e}\n\n"
+                "所以这次操作不算数 —— 它还会照常被检查更新。",
+                parent=parent_widget or self, app=self,
+                context="写 blocked.json 失败",
+            )
+            return key in load_blocked()
+        diag.event("屏蔽更新检查" if on else "取消屏蔽更新检查", label)
+        self._apply_block_change()
+        if on:
+            self.var_status.set(
+                f"已屏蔽「{label}」：以后检查更新、识别来源都跳过它"
+                f"（右键同一项就是取消）")
+        else:
+            self.var_status.set(
+                f"已取消屏蔽「{label}」：下次「检查更新」会重新查它")
+        return on
+
+    def _apply_block_change(self) -> None:
+        """屏蔽状态变了：就地重算受影响的行（**不动**别的检查结果）。
+
+        取消屏蔽的那一条会被退回「未检查」—— 屏蔽期间没查过它，
+        留着屏蔽前那天的旧结论（"有更新 r42"）比"未检查"更容易误导人。
+        """
+        blocked = load_blocked()
+        if self.results:
+            fresh = {source_key(r["entry"]): r for r in self._initial_rows()}
+            out = []
+            for r in self.results:
+                k = source_key(r.get("entry") or {})
+                if k not in blocked and r.get("status") == ST_BLOCKED:
+                    out.append(fresh.get(k) or {**r, "status": ST_UNCHECKED,
+                                                "checks": []})
+                else:
+                    out.append(r)
+            self.results = out
+            self._populate(out)
+        else:
+            self._populate()
+        # 部署页的「更新已屏蔽」标记也要立刻跟上
+        try:
+            if self._deploy_panel is not None:
+                self._deploy_panel._render()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _ask_unblock(self, entry: dict, action: str) -> bool:
+        """屏蔽的模组被**显式**操作时问一句：要取消屏蔽再做吗？
+
+        为什么要问、而不是直接放行：屏蔽的意思就是"别再查它"。
+        如果右键「只检查这一个」照样查，用户会以为屏蔽没生效；
+        直接静默不做，他又会觉得按钮坏了。所以给他一次选择。
+        """
+        label = entry.get("label") or entry.get("dirname") or "(未命名)"
+        if not messagebox.askyesno(
+            "这个模组已被屏蔽",
+            f"「{label}」现在是「已屏蔽」状态：\n"
+            "· 检查更新时跳过它\n"
+            "· 识别来源时也跳过它\n\n"
+            f"要取消屏蔽，然后{action}吗？",
+            parent=self,
+        ):
+            self.var_status.set(f"「{label}」仍是已屏蔽状态，这次没有动它。")
+            return False
+        self.toggle_block(entry)
+        return True
+
+    @staticmethod
+    def _block_menu_label(entry: dict | None) -> str:
+        """右键那一项该写什么 —— **已屏蔽就写"取消屏蔽"**（用户要求的）。"""
+        if entry and source_key(entry) in load_blocked():
+            return "取消屏蔽（恢复更新与查找）"
+        return "屏蔽这个模组的更新与查找"
 
     def _refresh_after_delete(self) -> None:
         """删完把两个页面都刷新一遍（列表来源是同一个库）。"""
@@ -1288,9 +1393,11 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
         来源（自相矛盾）。
         """
         saved = load_sources()
+        blocked = load_blocked()
         rows = []
         for e in self.library:
-            srcs = saved.get(source_key(e)) or []
+            key = source_key(e)
+            srcs = saved.get(key) or []
             known = None
             if srcs:
                 s0 = srcs[0]
@@ -1314,7 +1421,10 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
             rows.append(
                 {
                     "entry": e,
-                    "status": ST_UNCHECKED if known else ST_NO_SOURCE,
+                    # 屏蔽的模组：底表里直接写「已屏蔽」，不再说"还没检查"
+                    # （否则用户会一直以为漏查了它）
+                    "status": (ST_BLOCKED if key in blocked
+                               else (ST_UNCHECKED if known else ST_NO_SOURCE)),
                     "installed": e.get("installed_version", ""),
                     "best": known,
                     "checks": [],
@@ -1379,6 +1489,25 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
             return f"{base}（手动）"
         return base
 
+    @staticmethod
+    def _apply_blocked(rows: list[dict], blocked: dict) -> list[dict]:
+        """把「已屏蔽」叠加到要显示的行上（**不改 self.results**）。
+
+        屏蔽的模组仍然**留在列表里**（不隐藏）—— 用户要能看见它、
+        能右键取消；只列没被屏蔽的那些，他会以为模组丢了。
+        它只是被排到最后、整行压暗，状态列写「已屏蔽」。
+        """
+        if not blocked:
+            return rows
+        out = []
+        for r in rows:
+            key = source_key(r.get("entry") or {})
+            if key in blocked and r.get("status") != ST_BLOCKED:
+                out.append({**r, "status": ST_BLOCKED})
+            else:
+                out.append(r)
+        return out
+
     def _populate(self, results: list[dict] | None = None) -> None:
         self.tree.delete(*self.tree.get_children())
         self._row_widgets.clear()
@@ -1389,10 +1518,16 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
             # 叠加「已下载」状态：同一个线上版本若已经下过，就不再催着下
             rows = apply_download_records(results)
 
+        # ★ 屏蔽状态统一在**渲染这一层**叠加：blocked.json 是唯一事实来源。
+        #   如果写在每条改动路径上，就得每次都记得同步一次 —— 本项目已经吃过
+        #   "两处显示互相矛盾"的亏（来源总览那次）。这里改一次，处处生效。
+        rows = self._apply_blocked(rows, load_blocked())
+
         # 排序：有更新的排最前（已下载的排在「有更新」之后 —— 它也算"待处理"，
         # 但不用再动手下载，所以往后放一格，别抢了真正要下载的那些的位置）
         order = {ST_UPDATE: 0, ST_DOWNLOADED: 1, ST_BETA: 2, ST_ERROR: 3,
-                 ST_UNKNOWN: 4, ST_NO_SOURCE: 5, ST_UNCHECKED: 6, ST_OK: 7}
+                 ST_UNKNOWN: 4, ST_NO_SOURCE: 5, ST_UNCHECKED: 6, ST_OK: 7,
+                 ST_BLOCKED: 8}
         rows = sorted(rows, key=lambda r: order.get(r["status"], 9))
 
         for r in rows:
@@ -1443,6 +1578,12 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
             elif r["status"] == ST_OK:
                 # 无需动作时，才把「凭什么认定它是这个来源」显示出来
                 note = (best.get("how") or "无需处理")[:70]
+            elif r["status"] == ST_BLOCKED:
+                # ★ 必须写清"它在做什么、怎么恢复"：屏蔽后这一行不再被查，
+                #   不说明的话用户会以为检查漏了它（或以为功能坏了）。
+                #   这一列窄（约 25 个汉字），所以只写**两件必知的事**，
+                #   不加"上面的版本是屏蔽前查到的"这类补充 —— 会被截掉。
+                note = "已屏蔽：右键可取消屏蔽　·　不查更新、不找来源"
 
             # 上一版下过、文件却不在原处了 —— 说清楚，免得用户以为是新问题
             if r.get("prev_download"):
@@ -1493,6 +1634,7 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
         nosrc = sum(1 for r in rows if r["status"] == ST_NO_SOURCE)
         err = sum(1 for r in rows if r["status"] == ST_ERROR)
         unchecked = sum(1 for r in rows if r["status"] == ST_UNCHECKED)
+        blk = sum(1 for r in rows if r["status"] == ST_BLOCKED)
         parts = [f"共 {n} 个"]
         if upd:
             parts.append(f"有更新 {upd}")
@@ -1506,6 +1648,8 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
             parts.append(f"未识别 {nosrc}")
         if unchecked:
             parts.append(f"未检查 {unchecked}")
+        if blk:
+            parts.append(f"已屏蔽 {blk}")
         self.var_summary.set("　|　".join(parts))
         # 「下载全部」只看还能下的那些（已下载的不再列进去）
         auto = self._auto_download_targets(rows)
@@ -1617,8 +1761,12 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
         否则点两次「下载全部」就会把同一版重复下一遍。
         """
         out = []
+        blocked = load_blocked()
         for r in (self.results if rows is None else rows) or []:
             if r["status"] != ST_UPDATE:
+                continue
+            # 屏蔽的模组即使还留着屏蔽前那次「有更新」的旧结论，也不该被批量下载
+            if source_key(r.get("entry") or {}) in blocked:
                 continue
             best = r.get("best") or {}
             if not best.get("download_url"):
@@ -1768,8 +1916,11 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
                     return
                 eng.persist_resolved()
                 n = sum(1 for v in eng.resolved.values() if v)
-                diag.event("识别来源", f"完成：{n}/{len(eng.library)} 个已识别")
-                self.msgq.put(("found", (n, len(eng.library))))
+                # 分母只算**参与识别的**那些（屏蔽的不算）——
+                # 否则会打出「8/10 个已识别」，看起来像两个失败了。
+                total = sum(1 for e in eng.library if not eng.is_blocked(e))
+                diag.event("识别来源", f"完成：{n}/{total} 个已识别")
+                self.msgq.put(("found", (n, total)))
             except Exception as e:  # noqa: BLE001
                 diag.log("识别来源失败：\n" + traceback.format_exc(), "ERROR")
                 diag.event("识别来源", f"失败：{e}")
@@ -1868,6 +2019,7 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
         """检查指定的一批模组（部署页「检查这些有没有更新」走这里）。
 
         没有已部署的模组时给明确提示，而不是静默什么都不做。
+        被屏蔽的那些**先剔掉** —— 否则用户点了没反应、也不知道为什么。
         """
         if not keys:
             messagebox.showinfo(
@@ -1876,6 +2028,19 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
                 "如果你确实在 Arsenal 里部署过，先点「重新探测」确认读的是当前库。",
                 parent=self)
             return
+        blocked = load_blocked()
+        skipped = [k for k in keys if k in blocked]
+        keys = {k for k in keys if k not in blocked}
+        if not keys:
+            messagebox.showinfo(
+                "这些模组都被屏蔽了",
+                f"已部署的这 {len(skipped)} 个模组都被你屏蔽了，所以没有可查的。\n\n"
+                "想查它们：在列表里右键那一行 →「取消屏蔽（恢复更新与查找）」。",
+                parent=self)
+            return
+        if skipped:
+            self.var_status.set(
+                f"已跳过 {len(skipped)} 个已屏蔽的模组（右键可取消屏蔽）")
         self._start_check(only_keys=set(keys))
 
     def _check_this_one(self) -> None:
@@ -1885,7 +2050,12 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
             return
         if self._busy_guard():
             return
-        self._start_check(only_keys={source_key(w["entry"])})
+        entry = w["entry"]
+        # 屏蔽的模组：显式点它也要先问一句（屏蔽=别再查它，不能因为点了就悄悄放行）
+        if source_key(entry) in load_blocked():
+            if not self._ask_unblock(entry, "现在检查它"):
+                return
+        self._start_check(only_keys={source_key(entry)})
 
     def _pump(self) -> None:
         """主线程消费后台消息。
@@ -1935,11 +2105,18 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
             self.btn_check.configure(state="normal", text="检查更新")
             self.btn_find.configure(state="normal")
             self.prog.configure(value=0)
+            # ★ 引擎会跳过屏蔽的模组，所以完整检查的结果里**没有它们** ——
+            #   不补回来，屏蔽过的行会在检查完的一瞬间从列表里消失
+            #   （用户会以为"我 20 个模组丢了 2 个"）。_ensure_full 用底表补齐。
+            payload = self._ensure_full(payload)
             self.results = payload
             self._populate(payload)
             upd = sum(1 for r in payload if r["status"] == ST_UPDATE)
+            blk = sum(1 for r in payload if r["status"] == ST_BLOCKED)
+            tail = f"（已跳过 {blk} 个已屏蔽的）" if blk else ""
             self.var_status.set(
-                f"检查完成：{upd} 个有更新" if upd else "检查完成：没有正式版更新"
+                (f"检查完成：{upd} 个有更新" if upd else "检查完成：没有正式版更新")
+                + tail
             )
         elif kind == "done_partial":
             # 增量检查：把新结果**合并**回原有列表，其余保持不变。
@@ -2215,6 +2392,14 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
         iid = self.tree.identify_row(ev.y)
         if iid:
             self.tree.selection_set(iid)
+            # 那一项的写法跟着当前行变：已屏蔽 → 「取消屏蔽」（用户明确要求）
+            try:
+                self.menu.entryconfigure(
+                    self._block_menu_index,
+                    label=self._block_menu_label(
+                        (self._selected() or {}).get("entry")))
+            except (tk.TclError, AttributeError):
+                pass
             try:
                 self.menu.tk_popup(ev.x_root, ev.y_root)
             finally:
@@ -2238,6 +2423,13 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
         row = w["row"]
         st = row.get("status")
         best = (row.get("best") or {})
+
+        # ★ 屏蔽的行双击不该再"去下载 / 开网页"（那会和屏蔽的意思打架）——
+        #   给一个当场能点的出口：要恢复吗？
+        if st == ST_BLOCKED:
+            if self._ask_unblock(w["entry"], "检查它有没有更新"):
+                self._start_check(only_keys={source_key(w["entry"])})
+            return
 
         # ★ 「查不到」这一类，双击先给说明和出路（用户 2026-10-11 报
         #   「a 站的 mod 都查询失败」时定的）—— 直接甩一个网页给他，
@@ -2747,6 +2939,13 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
         self.delete_mod(entry.get("uuid") or "",
                         entry.get("label") or entry.get("dirname") or "")
 
+    def _ctx_toggle_block(self) -> None:
+        """右键：屏蔽 / 取消屏蔽这一行的更新检查与来源查找。"""
+        w = self._selected()
+        if not w:
+            return
+        self.toggle_block(w["entry"])
+
     def _ctx_undo_source(self) -> None:
         """撤销来源并重新识别（把手工指定的记录也一并撤掉）。
 
@@ -2763,6 +2962,11 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
         entry = w["entry"]
         key = source_key(entry)
         label = entry.get("label") or entry.get("dirname") or "(未命名)"
+
+        # 屏蔽着的模组：撤销后要重识别，得先问一句要不要取消屏蔽
+        if key in load_blocked():
+            if not self._ask_unblock(entry, "重新识别它的来源"):
+                return
 
         # ★ 先检查"撤销之后能不能真的重识别"，再做删除这种破坏性动作。
         #   反过来的话（先删、再发现不能跑）会把来源记录删掉却什么都没补回来，
@@ -3030,7 +3234,9 @@ class App(_ROOT_CLASS):  # type: ignore[misc,valid-type]
         key = source_key(entry)
         new_row = {
             "entry": entry,
-            "status": ST_UNCHECKED,
+            # 屏蔽着的模组改完来源也还是「已屏蔽」—— 别让它变回「未检查」，
+            # 否则用户会以为屏蔽被这次操作悄悄取消了。
+            "status": ST_BLOCKED if key in load_blocked() else ST_UNCHECKED,
             "installed": entry.get("installed_version", ""),
             "best": None,
             "checks": [],
@@ -3280,7 +3486,7 @@ class DeployPanel(ttk.Frame):
             "order": ("#", 46, "center"),
             "label": ("模组", 340, "w"),
             "slots": ("槽位", 62, "center"),
-            "mark": ("状态", 150, "w"),
+            "mark": ("状态", 210, "w"),
         }.items():
             self.tree.heading(c, text=t)
             self.tree.column(c, width=w, anchor=anchor)
@@ -3312,6 +3518,11 @@ class DeployPanel(ttk.Frame):
         self.menu.add_separator()
         self.menu.add_command(label="↑ 上移", command=lambda: self._nudge(-1))
         self.menu.add_command(label="↓ 下移", command=lambda: self._nudge(1))
+        self.menu.add_separator()
+        # 屏蔽：和更新检查页**同一个动作、同一段文案**（用户要求两处行为一致）
+        self.menu.add_command(label="屏蔽这个模组的更新与查找",
+                              command=self._toggle_block_selected)
+        self._block_menu_index = self.menu.index("end")
         self.menu.add_separator()
         self.menu.add_command(label="删除这个模组…",
                               command=self._delete_selected_mod)
@@ -3539,7 +3750,7 @@ class DeployPanel(ttk.Frame):
         return sorted(self.entries,
                       key=lambda x: (rank(x)[0], rank(x)[1], rank(x)[2]))
 
-    def _row_values(self, e: dict) -> tuple:
+    def _row_values(self, e: dict, blocked: set[str] | None = None) -> tuple:
         """一行的显示值。
 
         ★ 三件事要分清（用户明确要求）：
@@ -3572,6 +3783,13 @@ class DeployPanel(ttk.Frame):
             mark = "已启用，还没部署"
         else:
             mark = "未启用"
+        # ★ 屏蔽状态也要在这一页能看见（用户在这个页面看"哪些在用"）——
+        #   否则他会一直纳闷"这个模组怎么从来不提示更新"，
+        #   而原因（被他屏蔽了）在另一个页面才看得到。
+        if blocked is None:
+            blocked = set(load_blocked())
+        if source_key(e) in blocked:
+            mark += "　·　更新已屏蔽"
         n_slots = len(self._slot_cache.get(e["uuid"], []))
         order = e.get("deploy_order")
         return ("● 启用" if on else "○ 未启用",
@@ -3585,6 +3803,7 @@ class DeployPanel(ttk.Frame):
         sel = self.tree.selection()
         keep = sel[0] if sel else None
         self.tree.delete(*self.tree.get_children())
+        blocked = set(load_blocked())
         for e in self._visible():
             on = self.vars[e["uuid"]].get()
             in_use = e["uuid"] in self._mirror
@@ -3599,7 +3818,7 @@ class DeployPanel(ttk.Frame):
             else:
                 tag = "on" if on else "off"
             self.tree.insert("", "end", iid=e["uuid"],
-                             values=self._row_values(e), tags=(tag,))
+                             values=self._row_values(e, blocked), tags=(tag,))
         if keep and self.tree.exists(keep):
             self.tree.selection_set(keep)
 
@@ -3854,10 +4073,41 @@ class DeployPanel(ttk.Frame):
         iid = self.tree.identify_row(ev.y)
         if iid:
             self.tree.selection_set(iid)
+            # 已屏蔽的那一行，菜单项写「取消屏蔽」（与更新检查页一致）
+            try:
+                entry = next((e for e in self.entries
+                              if e.get("uuid") == iid), None)
+                app = self.app if self.app is not None else self.winfo_toplevel()
+                self.menu.entryconfigure(
+                    self._block_menu_index,
+                    label=app._block_menu_label(entry))
+            except (tk.TclError, AttributeError):
+                pass
             try:
                 self.menu.tk_popup(ev.x_root, ev.y_root)
             finally:
                 self.menu.grab_release()
+
+    def _toggle_block_selected(self) -> None:
+        """右键：屏蔽 / 取消屏蔽选中模组的「更新检查与来源查找」。
+
+        走 :meth:`App.toggle_block` 这**唯一一条**路径（两个页面共用），
+        所以文案、落盘、刷新行为天然一致。
+        """
+        sel = self.tree.selection()
+        if not sel:
+            self.var_note.set("先在列表里点一行，再屏蔽。")
+            return
+        uuid = sel[0]
+        entry = next((e for e in self.entries if e.get("uuid") == uuid), None)
+        app = self.app if self.app is not None else self.winfo_toplevel()
+        if entry is None or not hasattr(app, "toggle_block"):
+            return
+        on = app.toggle_block(entry, parent_widget=self.winfo_toplevel())
+        label = entry.get("label") or uuid
+        self.var_note.set(f"「{label}」" + ("已屏蔽更新检查（右键可取消）"
+                                           if on else "已取消屏蔽"))
+        self._render()
 
     def _delete_selected_mod(self) -> None:
         """删除选中的模组。
@@ -5705,6 +5955,12 @@ class QueryFailDialog(tk.Toplevel):
         而什么都不做），并把新结果**合并**进原有来源（别的站点不受影响）。
         """
         entry = self.row.get("entry") or {}
+        # 屏蔽的模组：查找会先问一句要不要取消屏蔽（不然点完什么也不会发生，
+        # 用户会以为"重新查找"坏了）
+        if source_key(entry) in load_blocked():
+            if not self.app._ask_unblock(entry, "重新查找它的来源"):
+                self.var_hint.set("这个模组已屏蔽，这次没有查找。")
+                return
         self.var_hint.set(hint)
         try:
             self.btn_refind.configure(state="disabled")
@@ -6583,10 +6839,34 @@ class SettingsDialog(tk.Toplevel):
 
     def _save(self) -> None:
         """保存两个 key + 备份保留份数（每行自己的「保存」按钮也走这里）。"""
-        write_config({
+        ok = write_config({
             "nexus_api_key": self.master_app.var_nexus_key.get().strip(),
             "github_token": self.master_app.var_github_token.get().strip(),
         })
+        # ★ 写失败必须**如实说**（不能照旧弹"已保存"）：
+        #   2026-10-18 丢 key 那次，界面也照样报"设置已保存"，用户完全看不出来。
+        if not ok:
+            messagebox.showerror(
+                "设置没能保存",
+                "配置文件写不进去（可能被别的程序占着，或磁盘只读）。\n\n"
+                "这次填的内容没有保存 —— 关掉设置窗口重开一次再试；\n"
+                "一直失败的话，把这条信息发给我。",
+                parent=self,
+            )
+            return
+        # 保存时发现"磁盘上那份读不出来"（已留档）—— 必须告诉用户一声，
+        # 否则他以后只会看到"key 怎么又空了"。
+        backed = arsenal.config_backup_path()
+        if backed:
+            messagebox.showwarning(
+                "旧配置已留档",
+                "保存时发现磁盘上的 config.json 读不出来"
+                "（可能上次被写坏，或另一个本工具窗口正在写）。\n\n"
+                f"旧文件已留档为：\n{backed}\n\n"
+                "这次填的内容已经写进新配置了。之前填过的值如果还在旧文件里，"
+                "可以打开它抄回来。",
+                parent=self,
+            )
         # 刚填的 key/token 立刻纳入脱敏表 —— 否则接下来 30 秒内的日志
         # 里还可能带着明文（脱敏表有缓存）。
         diag.refresh_secrets()

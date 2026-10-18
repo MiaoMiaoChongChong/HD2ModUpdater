@@ -123,6 +123,10 @@ matcher.candidates_for = lambda entry, **kw: [
     {"provider": "ayaka", "id": CN_SLUG_ENC,
      "url": providers.ayaka_url(CN_SLUG_ENC),
      "how": "（测试桩）索引命中", "confidence": "high"}]
+# ★ 预搜也是**联网**的（会打 GitHub 搜索 API）。不短路的话，网络一慢
+#   这个自称"不联网"的测试就会卡在"并发预搜 GitHub…"上，30 秒后误报失败
+#   （2026-10-18 实测复现；同一份代码在别的网络环境下是绿的）。
+matcher.batch_prefetch_github = lambda *a, **k: 0
 matcher.ensure_index = lambda *a, **k: []
 engine.check_one_source = lambda src, *a, **k: {
     **providers._empty(src.get("provider", "?")), "ok": True,
@@ -158,6 +162,11 @@ for _ in range(40):          # 让 _pump 把消息处理完
     time.sleep(0.05)
 
 matcher.candidates_for = _rot
+# ★ 预搜的桩**故意不还原**：本文件后面还有一次"重识别一无所获"的流程，
+#   那一次同样会走 resolve_sources → 真的去打 GitHub 搜索 API。
+#   以前它在慢网络下会卡满 30 秒，然后被误判成"没把来源放回去"
+#   （2026-10-18 实测：同一份代码在网络好的时候是绿的）。
+#   这个测试自称"不联网"，那就不该有任何一次真实请求。
 
 check("重新识别后来源表里是中文那个",
       (engine.load_sources().get("u-cn") or [{}])[0].get("id") == CN_SLUG_ENC,

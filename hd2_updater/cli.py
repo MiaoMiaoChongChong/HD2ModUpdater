@@ -101,6 +101,13 @@ def main(argv: list[str] | None = None) -> int:
     # 只读自检：不联网，确认「能独立运行 + 版本 + 读得到部署状态」。
     # 给打包验证用（EXE 拷到空目录、屏蔽 Python 环境变量后跑这条）。
     if "--selftest" in argv:
+        # ★ 自检**不许写用户的数据**：把数据目录临时指到一个空目录。
+        #   自检里有几步会写 config（版本记录之类），以前直接落在用户真实的
+        #   config.json 上 —— 2026-10-18 实测留下过测试用的 installed_versions。
+        #   读 Arsenal 库不受影响（`find_data_file` 仍会自动探测）。
+        import os as _os
+        import tempfile as _tf
+        _os.environ["HD2U_DATA_DIR"] = _tf.mkdtemp(prefix="hd2u_selftest_")
         from . import __version__
         path, how = find_data_file()
         print(f"version={__version__}")
@@ -568,6 +575,9 @@ def main(argv: list[str] | None = None) -> int:
         progress=lambda d, t, m: None,
     )
     eng.load()
+    if eng.blocked:
+        # 命令行里也要如实说一声，别让人以为"漏查了几个"
+        print(f"（已屏蔽 {len(eng.blocked)} 个模组，本次检查与识别都跳过）")
     eng.resolve_sources()
     results = eng.check()
     eng.persist_resolved()
