@@ -213,6 +213,64 @@ def read_version_overrides() -> dict:
     return (read_config().get("version_overrides") or {})
 
 
+def _merge_nexus_and_imported(nexus_version: str, imported: str) -> str:
+    """把「N 网记的版本」和「导入时记的版本」合并成一个本地版本。
+
+    ★ 为什么需要这一层（2026-10-19 用户实测：
+      「这个 mod 我更新以后还是显示未更新…名字也都成 V20 了本地版本还是 V19」）：
+
+      这两个值来自**两条互不相通的路径**，谁也不总是准：
+
+        · ``nexus_version`` = Arsenal 库里那条 ``nexusData.version``。
+          只有**从 N 网下载安装**时才会被写成新版本；用户**手动导入一个
+          zip**（比如从 GitHub 下的）时，Arsenal 根本不知道版本变了，
+          这个值就**永远停在旧值**（实测：Bingus Shared Loader 库里记 19，
+          实际装的是 v20）。
+
+        · ``imported`` = 本工具导入那一刻记下的版本，且带内容签名核对
+          （见 :func:`_resolve_installed`）—— 它说的是"**现在磁盘上**装的
+          到底是哪个版本"，是更硬的证据。
+
+      之前的代码是 ``nexus_version or _pick_local_version(...)`` ——
+      ``or`` 是**短路**的：``nexus_version`` 只要非空就赢，后面的导入记录
+      根本没机会被读到。于是这类模组会**永远**显示旧版本、永远报「有更新」，
+      用户重装多少次都没用。
+
+    ★ 规则（与 :func:`_pick_local_version` 里"目录名 vs 元数据"的处理同源）：
+      · 两边都比得上大小 → **取更新的那个**（陈旧的那个让位）；
+      · 比不了（格式不同 / 缺一方）→ **保留 N 网记录**（它是 Arsenal 自己
+        写的、语义上更"官方"，而且这条路径不引入新行为）；
+      · 只有导入记录 → 用导入记录；只有 N 网记录 → 用 N 网记录。
+
+    ★ 为什么不"导入记录无条件优先"：
+      导入记录虽然更贴近磁盘，但它记的是**压缩包名字里的版本**，
+      解析偶尔会错（作者把版本写在别处、或 zip 名里没有版本号）。
+      "取更新的那个"在这种情况下也不会更差 —— 因为如果它更旧，
+      就会自动让位给 N 网记录；只有它确实更新时才被采用。
+    """
+    from .util import compare as _cmp
+
+    nv = str(nexus_version or "").strip()
+    im = str(imported or "").strip()
+    if not nv:
+        return im
+    if not im:
+        return nv
+    if nv == im:
+        return nv
+    try:
+        # compare(a, b) == "newer" 的意思是「**b 比 a 新**」。
+        # 这里 a=nv（可能陈旧）、b=im（导入时记的）：
+        #   "newer" → 导入记录更新 → 用导入记录
+        #   "older" → N 网记录更新 → 用 N 网记录
+        rel = _cmp(nv, im)
+    except Exception:  # noqa: BLE001
+        rel = "unknown"
+    if rel == "newer":
+        return im
+    return nv
+
+
 def _pick_local_version(entry: dict, imported: str) -> str:
     """在没有导入记录时，从「目录名」和「元数据」两处证据里挑一个。
 
@@ -719,8 +777,15 @@ def load_library(data_file: str) -> list[dict]:
         _imported = _resolve_installed(installed_recs.get(entry["uuid"]),
                                       entry.get("path") or "")
         entry["imported_version"] = _imported
+        # ★ 2026-10-19 修正（用户实测：「更新以后还是显示未更新…名字成 V20 了
+        #   本地版本还是 V19」）：
+        #   原来是 `entry["nexus_version"] or _pick_local_version(...)` ——
+        #   `or` 短路，N 网那条**陈旧**的 nexusData.version 只要非空就赢，
+        #   导入时记下的确切版本（"20"）根本没机会被读到 → 永远报「有更新」。
+        #   现在先把两个来源合并（冲突时取更新的那个），再往下走。
+        _merged = _merge_nexus_and_imported(entry["nexus_version"], _imported)
         auto = (
-            entry["nexus_version"]
+            _merged
             or _pick_local_version(entry, _imported)
             or ""
         )

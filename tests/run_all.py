@@ -31,6 +31,8 @@ STEPS = [
     ("离线测试：来源候选与“需用户确认”", ["tests/test_choice.py"]),
     ("离线测试：issue #1「本地版本不冻结」（内容签名 / 导入保留 nexusData）",
      ["tests/test_issue1_version_freeze.py"]),
+    ("离线测试：N 网陈旧版本不能压住导入记录（手动导入 zip 后仍报有更新）",
+     ["tests/test_stale_nexus_version.py"]),
     ("离线测试：错误分类（已删除的 mod 不能说成「没填 API key」）",
      ["tests/test_issue1_error_kind.py"]),
     ("离线测试：下载页（下载 → 导入）", ["tests/test_downloads.py"]),

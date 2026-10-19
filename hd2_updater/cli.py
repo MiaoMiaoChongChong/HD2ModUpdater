@@ -467,6 +467,73 @@ def main(argv: list[str] | None = None) -> int:
             print("version2=OK 导入新版后本地版本跟上"
                   "（复用旧目录时也能认对）")
 
+            # ★★ 2026-10-19：N 网那条**陈旧**的 nexusData.version 不能压住
+            #   导入记录（用户实测：「更新以后还是显示未更新…名字成 V20 了
+            #   本地版本还是 V19」）。这里照用户那个模组的真实数据走一遍：
+            #   N 网记 19、实际装的是 20 → 本地版本必须是 20、判定必须是「已最新」。
+            #   放在 selftest 里 = 跑的是**打包后的 EXE**，能证明修复真的在包里。
+            _stale_ok = True
+            try:
+                _t3 = _tf2.mkdtemp(prefix="hd2u_selftest_s_")
+                _md3 = _os2.path.join(_t3, "mods")
+                _os2.makedirs(_md3)
+                _us3 = "612eaf70-d682-43c7-9efd-16dcc695f977"
+                _dn3 = ("Bingus Shared Loader 16292 19 2026-10-05T00-28Z "
+                        "eqrMD7Qqb_AR864690")
+                _dd3 = _os2.path.join(_md3, _dn3)
+                _os2.makedirs(_dd3)
+                with open(_os2.path.join(_dd3, "a.patch_0"), "wb") as _fh:
+                    _fh.write(b"loader v20 content")
+                # 库条目：nexusData.version = 19（陈旧，Arsenal 不会因手动
+                # 导入 zip 而更新它）—— 这是本条要打的靶子
+                _e4 = {"uuid": _us3, "label": "Bingus Shared Loader - v20",
+                       "path": _dd3, "description": "", "iconPath": None,
+                       "tags": ["misc"], "patchFileNames": [],
+                       "options": [], "contentHash": "",
+                       "addedAt": "", "previousVersions": [],
+                       "nexusData": {"modId": "16292", "fileId": "67485",
+                                     "version": "19",
+                                     "updateTimestamp": 1791160130}}
+                _p4 = dict(_e4)
+                _p4.update({"enabled": True, "deployed": True,
+                            "changed": False, "new": False,
+                            "copiedFiles": [], "renamedFiles": []})
+                _df4 = _os2.path.join(_t3, "hd2a_data.json")
+                with open(_df4, "w", encoding="utf-8") as _f:
+                    _js.dump({"modsLibrary": [_e4],
+                              "modsList": {"P": {"mods": [_p4]}},
+                              "selectedProfile": "P",
+                              "userModsDir": _md3,
+                              "userGameDir": "D:\\g",
+                              "setTopPriority": False}, _f,
+                             ensure_ascii=False)
+                # 导入那一刻记下的版本 + 内容签名（= 现在磁盘上的内容）
+                _ar.set_installed_version(_us3, "20",
+                                          _ar.content_sig(_dd3, fresh=True))
+                _row4 = next(x for x in _ar.load_library(_df4)
+                             if x["uuid"] == _us3)
+                if _row4["installed_version"] != "20":
+                    _stale_ok = False
+                else:
+                    from .engine import evaluate as _ev4
+                    _ev4r = _ev4(_row4, [{"provider": "github", "ok": True,
+                                          "version": "v20", "url": "x",
+                                          "download_url": "y"}])
+                    if _ev4r["status"] != "ok":
+                        _stale_ok = False
+                import shutil as _sh4
+                _sh4.rmtree(_t3, ignore_errors=True)
+            except Exception as e:  # noqa: BLE001
+                _stale_ok = False
+                print(f"   陈旧 N 网版本校验异常：{e}")
+            if not _stale_ok:
+                print("stale=FAIL N 网那条旧版本压住了导入记录"
+                      "（手动导入 zip 后会永远报有更新）")
+                print("selftest=FAIL 本地版本取值链不对")
+                return 3
+            print("stale=OK N 网旧版本不再压住导入记录"
+                  "（手动导入 zip 后本地版本跟得上）")
+
             # ★★ 存量自愈（2026-10-12，issue #1 评估查出的缺口）：
             #   老用户升级上来时，v1.8.11 写的旧格式记录（没有内容签名）
             #   会被永久沿用 —— "不冻结"机制对它完全不生效，于是他仍然看到

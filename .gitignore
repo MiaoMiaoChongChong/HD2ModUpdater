@@ -8,7 +8,9 @@ env/
 
 # PyInstaller 产物
 build/
+build_new/
 dist/
+dist_new/
 *.spec
 
 # 运行时数据（配置/缓存/下载，含个人 API key 与本机路径，绝不提交）
